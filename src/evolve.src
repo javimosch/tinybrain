@@ -1,0 +1,227 @@
+// tinybrain evolve — neuroevolution trainer (M1).
+// A genetic algorithm over fixed-topology nets: no gradients, no labels —
+// just a fitness closure `func(net) float`, for control tasks (game AI) where
+// the "dataset" is a simulation. Composes with src/tinybrain.src.
+
+type EvolveCfg struct {
+	pop int
+	generations int
+	elite int
+	mut_rate float
+	mut_sigma float
+	seed int
+	target_fitness float
+	log_path string
+	print_every int
+}
+
+type EvolveResult struct {
+	best_fitness float
+	generations int
+	evals int
+}
+
+func evolve_cfg_default() (cfg) {
+	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0}
+}
+
+// --- genome <-> net ---
+
+func net_genome_len(n) (gl) {
+	gl = 0
+	l := 1
+	while l < len(n.topology) {
+		gl = gl + n.topology[l - 1] * n.topology[l] + n.topology[l]
+		l = l + 1
+	}
+}
+
+func net_get_genome(n) (g) {
+	g = []float{}
+	l := 0
+	while l < len(n.weights) {
+		for _, v := range n.weights[l] {
+			g = append(g, v)
+		}
+		for _, v := range n.biases[l] {
+			g = append(g, v)
+		}
+		l = l + 1
+	}
+}
+
+// loads g into n's weights/biases in place (slices share backing storage)
+func net_set_genome(n, g) {
+	p := 0
+	l := 0
+	while l < len(n.weights) {
+		i := 0
+		while i < len(n.weights[l]) {
+			n.weights[l][i] = g[p]
+			p = p + 1
+			i = i + 1
+		}
+		j := 0
+		while j < len(n.biases[l]) {
+			n.biases[l][j] = g[p]
+			p = p + 1
+			j = j + 1
+		}
+		l = l + 1
+	}
+}
+
+// --- GA internals ---
+
+func tb_genome_random(gl, scale) (g) {
+	g = []float{}
+	i := 0
+	while i < gl {
+		g = append(g, tb_randf_range(-scale, scale))
+		i = i + 1
+	}
+}
+
+func tb_genome_copy(g) (c) {
+	c = []float{}
+	for _, v := range g {
+		c = append(c, v)
+	}
+}
+
+// uniform crossover + per-gene mutation
+func tb_genome_child(a, b, mutRate, mutSigma) (c) {
+	c = []float{}
+	i := 0
+	while i < len(a) {
+		v := a[i]
+		if tb_randf() < 0.5 {
+			v = b[i]
+		}
+		if tb_randf() < mutRate {
+			v = v + tb_randf_range(-mutSigma, mutSigma)
+		}
+		c = append(c, v)
+		i = i + 1
+	}
+}
+
+// tournament of 3 over fitness, returns the winner's index
+func tb_tournament(fit) (idx) {
+	idx = int(tb_randf() * float(len(fit)))
+	k := 0
+	while k < 2 {
+		j := int(tb_randf() * float(len(fit)))
+		if fit[j] > fit[idx] {
+			idx = j
+		}
+		k = k + 1
+	}
+}
+
+// descending order of fit as an index permutation (selection sort; pop is small)
+func tb_sort_desc(fit) (order) {
+	order = []int{}
+	i := 0
+	while i < len(fit) {
+		order = append(order, i)
+		i = i + 1
+	}
+	i = 0
+	while i < len(order) {
+		best := i
+		j := i + 1
+		while j < len(order) {
+			if fit[order[j]] > fit[order[best]] {
+				best = j
+			}
+			j = j + 1
+		}
+		tmp := order[i]
+		order[i] = order[best]
+		order[best] = tmp
+		i = i + 1
+	}
+}
+
+// --- the trainer ---
+// Evolves genomes for n's topology, maximizing fitfn(n).
+// Returns (result, champion-net): the champion's weights are also set into the
+// caller's n in place (shared slices), but meta is only stamped on the RETURNED
+// net (structs are value types — a callee cannot mutate the caller's meta field).
+// Logs one JSONL line per generation to cfg.log_path (rewritten each gen, so it
+// is live-tailable) and to stdout every cfg.print_every generations.
+func evolve_run(n, fitfn, cfg) (res, champ) {
+	tb_seed(cfg.seed)
+	gl := net_genome_len(n)
+	pop := tb_mat_empty(0)
+	i := 0
+	while i < cfg.pop {
+		pop = append(pop, tb_genome_random(gl, 1.0))
+		i = i + 1
+	}
+	res = EvolveResult{best_fitness: -1000000000.0, generations: 0, evals: 0}
+	logLines := []string{}
+	gen := 0
+	while gen < cfg.generations {
+		fit := []float{}
+		i = 0
+		while i < cfg.pop {
+			v := 0.0
+			// the arena reclaims everything the episode allocates; only the
+			// scalar fitness (assigned, not allocated) may cross the boundary
+			arena {
+				net_set_genome(n, pop[i])
+				v = fitfn(n)
+			}
+			fit = append(fit, v)
+			res.evals = res.evals + 1
+			i = i + 1
+		}
+		order := tb_sort_desc(fit)
+		best := fit[order[0]]
+		sum := 0.0
+		for _, f := range fit {
+			sum = sum + f
+		}
+		mean := sum / float(cfg.pop)
+		res.generations = gen + 1
+		if best > res.best_fitness {
+			res.best_fitness = best
+		}
+		line := "{\"gen\":" + str(gen) + ",\"best\":" + tb_fmt(best) + ",\"mean\":" + tb_fmt(mean) + "}"
+		logLines = append(logLines, line)
+		if len(cfg.log_path) > 0 {
+			write_file(cfg.log_path, join(logLines, "\n") + "\n")
+		}
+		if cfg.print_every > 0 && gen % cfg.print_every == 0 {
+			println(line)
+			flush()
+		}
+		champion := pop[order[0]]
+		if cfg.target_fitness > 0.0 && best >= cfg.target_fitness {
+			net_set_genome(n, champion)
+			break
+		}
+		// next generation: elites unchanged, rest bred by tournament
+		next := tb_mat_empty(0)
+		e := 0
+		while e < cfg.elite && e < cfg.pop {
+			next = append(next, tb_genome_copy(pop[order[e]]))
+			e = e + 1
+		}
+		while len(next) < cfg.pop {
+			pa := pop[tb_tournament(fit)]
+			pb := pop[tb_tournament(fit)]
+			next = append(next, tb_genome_child(pa, pb, cfg.mut_rate, cfg.mut_sigma))
+		}
+		net_set_genome(n, champion)
+		pop = next
+		gen = gen + 1
+	}
+	n.meta.trained_by = "evolve"
+	n.meta.seed = cfg.seed
+	n.meta.loss = -res.best_fitness
+	n.meta.epochs = res.generations
+	champ = n
+}

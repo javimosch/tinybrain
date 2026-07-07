@@ -1,0 +1,175 @@
+// tinybrain racesim — headless oval-circuit driving simulation (M1).
+// The track is an ELLIPTICAL ring (two concentric ellipses), so curvature varies
+// around the lap — a constant-steering policy crashes at the tight ends, forcing
+// the net to actually use its ray sensors. Everything is analytic (ray/ellipse
+// intersections), so training runs thousands of episodes per second with no
+// graphics. The M2 raylib game reuses this module unchanged and just draws it.
+//
+// Net contract: inputs = 5 normalized ray distances + normalized speed (6),
+// outputs = [steer, throttle_raw] with tanh activation on the output layer
+// (steer in [-1,1]; throttle = (out[1]+1)/2 in [0,1]). Topology [6, H, 2].
+
+type Track struct {
+	ain float
+	bin float
+	aout float
+	bout float
+}
+
+type Car struct {
+	x float
+	y float
+	heading float
+	speed float
+	alive bool
+}
+
+type Episode struct {
+	progress float
+	ticks int
+	crashed bool
+	laps float
+}
+
+// outer 140x60, inner 115x30: tight enough at the ends that full throttle
+// crashes — the driver must brake for corners or find a wide racing line
+func track_default() (t) {
+	t = Track{ain: 115.0, bin: 30.0, aout: 140.0, bout: 60.0}
+}
+
+// physics/sensor constants
+func sim_dt() (v) { v = 0.033333333333 }
+func sim_max_speed() (v) { v = 30.0 }
+func sim_accel() (v) { v = 25.0 }
+func sim_drag() (v) { v = 0.8 }
+func sim_steer_rate() (v) { v = 1.2 }
+func sim_car_radius() (v) { v = 2.0 }
+func sim_ray_max() (v) { v = 60.0 }
+
+func tb_cos(x) (y) {
+	y = sin(x + pi() / 2.0)
+}
+
+// car at the bottom of the ring, mid-track, facing counterclockwise (+x)
+func car_spawn(t) (c) {
+	c = Car{x: 0.0, y: -(t.bin + t.bout) / 2.0, heading: 0.0, speed: 0.0, alive: true}
+}
+
+// smallest positive t with (px+t*dx)^2/a^2 + (py+t*dy)^2/b^2 = 1; -1 if the ray misses
+func ray_ellipse(px, py, dx, dy, a, b) (t) {
+	qa := (dx * dx) / (a * a) + (dy * dy) / (b * b)
+	qb := 2.0 * ((px * dx) / (a * a) + (py * dy) / (b * b))
+	qc := (px * px) / (a * a) + (py * py) / (b * b) - 1.0
+	disc := qb * qb - 4.0 * qa * qc
+	if disc < 0.0 {
+		t = -1.0
+		return
+	}
+	sq := sqrt(disc)
+	t = (-qb - sq) / (2.0 * qa)
+	if t < 0.0 {
+		t = (-qb + sq) / (2.0 * qa)
+	}
+	if t < 0.0 {
+		t = -1.0
+	}
+}
+
+// distance from (x,y) along world angle `ang` to the nearest track border
+func ray_track(t, x, y, ang) (d) {
+	dx := tb_cos(ang)
+	dy := sin(ang)
+	d = sim_ray_max()
+	touter := ray_ellipse(x, y, dx, dy, t.aout, t.bout)
+	if touter >= 0.0 && touter < d {
+		d = touter
+	}
+	tinner := ray_ellipse(x, y, dx, dy, t.ain, t.bin)
+	if tinner >= 0.0 && tinner < d {
+		d = tinner
+	}
+}
+
+// the net's input vector: 5 rays (-60,-30,0,+30,+60 degrees) + speed, all in [0,1]
+func car_sensors(t, c) (s) {
+	s = []float{}
+	spread := pi() / 3.0
+	k := 0
+	while k < 5 {
+		rel := -spread + float(k) * (spread / 2.0)
+		s = append(s, ray_track(t, c.x, c.y, c.heading + rel) / sim_ray_max())
+		k = k + 1
+	}
+	s = append(s, c.speed / sim_max_speed())
+}
+
+// 1 if (x,y) is inside the ellipse (a,b), else 0 — with axes pre-adjusted by the caller
+func tb_in_ellipse(x, y, a, b) (in) {
+	in = 0
+	if (x * x) / (a * a) + (y * y) / (b * b) <= 1.0 {
+		in = 1
+	}
+}
+
+// on-track test with the car radius as margin (axes inflated/deflated approximation)
+func car_on_track(t, x, y) (ok) {
+	r := sim_car_radius()
+	ok = false
+	if tb_in_ellipse(x, y, t.aout - r, t.bout - r) == 1 && tb_in_ellipse(x, y, t.ain + r, t.bin + r) == 0 {
+		ok = true
+	}
+}
+
+// advance one tick; steer in [-1,1], throttle in [0,1]; kills the car on border contact
+func car_step(t, c, steer, throttle) (c2) {
+	c2 = c
+	if steer > 1.0 { steer = 1.0 }
+	if steer < -1.0 { steer = -1.0 }
+	if throttle > 1.0 { throttle = 1.0 }
+	if throttle < 0.0 { throttle = 0.0 }
+	dt := sim_dt()
+	c2.heading = c.heading + steer * sim_steer_rate() * dt
+	c2.speed = c.speed + (throttle * sim_accel() - sim_drag() * c.speed) * dt
+	if c2.speed < 0.0 { c2.speed = 0.0 }
+	if c2.speed > sim_max_speed() { c2.speed = sim_max_speed() }
+	c2.x = c.x + tb_cos(c2.heading) * c2.speed * dt
+	c2.y = c.y + sin(c2.heading) * c2.speed * dt
+	if car_on_track(t, c2.x, c2.y) == false {
+		c2.alive = false
+	}
+}
+
+// signed shortest angular delta between two positions around the center
+func tb_ang_delta(x0, y0, x1, y1) (d) {
+	a0 := atan2(y0, x0)
+	a1 := atan2(y1, x1)
+	d = a1 - a0
+	while d > pi() {
+		d = d - 2.0 * pi()
+	}
+	while d < -pi() {
+		d = d + 2.0 * pi()
+	}
+}
+
+// run one full episode: the net drives from spawn until crash or maxTicks.
+// progress = unwrapped angle traveled around the ring (radians; one lap = 2*pi),
+// counterclockwise positive.
+func sim_episode(n, t, maxTicks) (ep) {
+	ep = Episode{progress: 0.0, ticks: 0, crashed: false, laps: 0.0}
+	c := car_spawn(t)
+	tick := 0
+	while tick < maxTicks {
+		out := net_forward(n, car_sensors(t, c))
+		c2 := car_step(t, c, out[0], (out[1] + 1.0) / 2.0)
+		ep.progress = ep.progress + tb_ang_delta(c.x, c.y, c2.x, c2.y)
+		c = c2
+		tick = tick + 1
+		if c.alive == false {
+			ep.crashed = true
+			break
+		}
+	}
+	ep.ticks = tick
+	ep.laps = ep.progress / (2.0 * pi())
+}

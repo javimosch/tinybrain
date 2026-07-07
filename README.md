@@ -4,7 +4,41 @@ Train tiny neural networks in pure [machin](https://github.com/javimosch/machin)
 
 Not a deep-learning framework. tinybrain is for **tiny goals**: game-AI controllers (cars that learn to drive a track), small classifiers (intent routing, data analysis), regressors/scorers. Generative text is out of scope, honestly and on purpose.
 
-## M0 (this milestone)
+## M1 — neuroevolution + the racing sim
+
+- **`src/evolve.src`** — a genetic-algorithm trainer over fixed-topology nets: no gradients, no labels, just a fitness closure `func(net) float`. Tournament selection, uniform crossover, per-gene mutation, elitism, early stop on a target fitness, live-tailable JSONL log (one line per generation: `{"gen":i,"best":f,"mean":f}`).
+- **`src/racesim.src`** — a headless oval-circuit driving sim: an **elliptical** ring (curvature varies, so a constant-steering policy provably cannot lap it — tested), 5 analytic ray sensors + speed in, steering + throttle out, death on border contact. Fully analytic, thousands of episodes/second, zero graphics — the M2 game will reuse it unchanged and just draw.
+- **The result**: `examples/race_train.src` evolves a `[6,8,2]` driver from random weights to **4.3 clean laps in 90 simulated seconds** (physical optimum ≈ 4.7) in 7 generations / ~650ms, and saves `models/driver.json` — the artifact the game loads.
+
+```sh
+# both suites: 24 + 21 assertions
+machin test src/tinybrain.src src/tinybrain_test.src
+machin test src/tinybrain.src src/evolve.src src/racesim.src src/m1_test.src
+
+# evolve the driver -> models/driver.json + models/race_train.jsonl
+machin encode src/tinybrain.src src/evolve.src src/racesim.src examples/race_train.src > /tmp/rt.mfl
+machin run /tmp/rt.mfl
+```
+
+```go
+// evolve anything: give it a net and a fitness closure
+fit := func(nn) {
+    ep := sim_episode(nn, track_default(), 2700)
+    f := abs(ep.progress)
+    if ep.crashed { f = f - 1.0 }
+    return f
+}
+cfg := evolve_cfg_default()          // pop 60, elite 4, mut 0.15/0.4, seed 42
+cfg.target_fitness = 4.3 * 2.0 * pi()
+res, champ := evolve_run(net_new([]int{6, 8, 2}, []string{"tanh", "tanh"}, 42), fit, cfg)
+net_save(champ, "models/driver.json")
+```
+
+Honesty notes: a lucky *random* net can already lap this track slowly (reactive wall-avoidance is easy — the sim would be dishonest if it pretended otherwise); what evolution demonstrably adds is **refinement toward the optimum** (3.3 → 4.3 laps). And `evolve_run` returns the stamped champion as a second value because MFL structs are value types — the caller's net gets the champion *weights* (shared slices) but not the meta.
+
+## M0
+
+
 
 - **MLP core** — arbitrary topology, `tanh` / `sigmoid` / `relu` / `linear` / `softmax` activations, pure-MFL forward pass (a few matmuls — runs per-frame at 60fps trivially).
 - **SGD backprop trainer** — MSE loss, or cross-entropy when the output layer is `softmax`.
@@ -63,6 +97,5 @@ cls := net_predict_class(n, inputs)         // argmax, for classifiers
 
 ## Roadmap
 
-- **M1** — neuroevolution trainer (GA over fixed-topology nets, fitness closure) + headless oval-track racing sim: cars learn to lap without touching the borders.
 - **M2** — the raylib top-down racing game that loads the trained artifact.
 - **M3** — generalize + publish: CLI for the supervised path, intent-classifier demo, awesome-machin.

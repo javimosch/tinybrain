@@ -1,0 +1,161 @@
+// tinybrain M1 test suite — run with:
+// machin test src/tinybrain.src src/evolve.src src/racesim.src src/m1_test.src
+
+func approx(a, b, eps) (ok) {
+	ok = abs(a - b) < eps
+}
+
+func test_ray_geometry() {
+	t := track_default()
+	// from mid-track at the bottom (0,-45): +y hits the inner ellipse (b=30) at 15,
+	// -y hits the outer ellipse (b=60) at 15
+	up := ray_track(t, 0.0, -45.0, pi() / 2.0)
+	down := ray_track(t, 0.0, -45.0, -pi() / 2.0)
+	assert(approx(up, 15.0, 0.0001), "ray up hits inner wall at 15 (got " + str(up) + ")")
+	assert(approx(down, 15.0, 0.0001), "ray down hits outer wall at 15 (got " + str(down) + ")")
+	// tangent ray from (0,-45) along +x: outer hit at ~92.6, inner missed -> clamps at ray_max
+	fwd := ray_track(t, 0.0, -45.0, 0.0)
+	assert(approx(fwd, 60.0, 0.0001), "tangent ray clamps at ray_max 60 (got " + str(fwd) + ")")
+}
+
+// the track is NOT solvable by a constant policy — sensors are actually required
+func test_constant_policy_fails() {
+	t := track_default()
+	bestLaps := 0.0
+	k := 0
+	while k <= 40 {
+		steer := -1.0 + float(k) * 0.05
+		c := car_spawn(t)
+		prog := 0.0
+		tick := 0
+		while tick < 2700 && c.alive {
+			c2 := car_step(t, c, steer, 1.0)
+			prog = prog + tb_ang_delta(c.x, c.y, c2.x, c2.y)
+			c = c2
+			tick = tick + 1
+		}
+		if abs(prog) / (2.0 * pi()) > bestLaps {
+			bestLaps = abs(prog) / (2.0 * pi())
+		}
+		k = k + 1
+	}
+	assert(bestLaps < 1.0, "no constant steer completes a lap (best " + str(bestLaps) + " laps)")
+}
+
+func test_sensors_and_step() {
+	t := track_default()
+	c := car_spawn(t)
+	s := car_sensors(t, c)
+	assert_eq_int(len(s), 6, "6 sensor inputs")
+	okRange := true
+	for _, v := range s {
+		if v < 0.0 || v > 1.0 {
+			okRange = false
+		}
+	}
+	assert(okRange, "sensors normalized to [0,1]")
+	// full throttle straight ahead: speed grows, car stays alive on the centerline
+	i := 0
+	while i < 30 {
+		c = car_step(t, c, 0.0, 1.0)
+		i = i + 1
+	}
+	assert(c.speed > 5.0, "throttle accelerates (speed " + str(c.speed) + ")")
+	assert(c.alive, "car alive on centerline")
+	// steer hard toward the inner wall until contact kills it
+	i = 0
+	while i < 600 && c.alive {
+		c = car_step(t, c, 1.0, 1.0)
+		i = i + 1
+	}
+	assert(c.alive == false, "wall contact kills the car")
+}
+
+func test_ang_delta() {
+	d := tb_ang_delta(80.0, 0.0, 79.9, 3.0)
+	assert(d > 0.0, "ccw movement gives positive delta")
+	d2 := tb_ang_delta(80.0, 0.0, 79.9, -3.0)
+	assert(d2 < 0.0, "cw movement gives negative delta")
+	// wrap-around: crossing the -pi/pi seam stays small
+	d3 := tb_ang_delta(-80.0, -0.1, -80.0, 0.1)
+	assert(abs(d3) < 0.1, "seam crossing stays small (got " + str(d3) + ")")
+}
+
+func test_genome_roundtrip() {
+	n := net_new([]int{4, 6, 2}, []string{"tanh", "tanh"}, 9)
+	g := net_get_genome(n)
+	assert_eq_int(len(g), net_genome_len(n), "genome length matches topology (4*6+6+6*2+2)")
+	assert_eq_int(net_genome_len(n), 44, "genome length is 44")
+	x := []float{0.3, -0.5, 0.9, 0.1}
+	before := net_forward(n, x)
+	m := net_new([]int{4, 6, 2}, []string{"tanh", "tanh"}, 777)
+	net_set_genome(m, g)
+	after := net_forward(m, x)
+	assert(approx(before[0], after[0], 0.0000000001) && approx(before[1], after[1], 0.0000000001), "genome transplant preserves behavior")
+}
+
+// evolution solves XOR with zero gradients
+func test_evolve_xor() {
+	n := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+	fit := func(nn) {
+		mse := 0.0
+		s := 0
+		while s < 4 {
+			d := net_forward(nn, ds.x[s])[0] - ds.y[s][0]
+			mse = mse + d * d
+			s = s + 1
+		}
+		return 1.0 - mse / 4.0
+	}
+	cfg := evolve_cfg_default()
+	cfg.pop = 60
+	cfg.generations = 120
+	cfg.target_fitness = 0.99
+	res, champ := evolve_run(n, fit, cfg)
+	assert(res.best_fitness > 0.99, "evolved XOR fitness > 0.99 (got " + str(res.best_fitness) + ")")
+	assert(net_forward(champ, []float{0.0, 1.0})[0] > 0.7, "evolved xor 0,1 -> high")
+	assert(net_forward(champ, []float{1.0, 1.0})[0] < 0.3, "evolved xor 1,1 -> low")
+	assert_eq_str(champ.meta.trained_by, "evolve", "champion meta stamped")
+}
+
+// THE M1 test: cars learn to lap the oval without touching the borders
+func test_evolve_driver() {
+	t := track_default()
+	n := net_new([]int{6, 8, 2}, []string{"tanh", "tanh"}, 42)
+	fit := func(nn) {
+		ep := sim_episode(nn, t, 1800)
+		f := abs(ep.progress)
+		if ep.crashed {
+			f = f - 1.0
+		}
+		return f
+	}
+	cfg := evolve_cfg_default()
+	cfg.pop = 60
+	cfg.generations = 150
+	cfg.target_fitness = 2.0 * pi() + 0.5
+	res, champ := evolve_run(n, fit, cfg)
+	ep := sim_episode(champ, t, 1800)
+	assert(abs(ep.laps) >= 1.0, "champion completes >= 1 lap (laps " + str(ep.laps) + ", fitness " + str(res.best_fitness) + ", gens " + str(res.generations) + ")")
+	assert(ep.crashed == false, "champion never touches a border in 60 simulated seconds")
+}
+
+func main() {
+	test_ray_geometry()
+	test_constant_policy_fails()
+	test_sensors_and_step()
+	test_ang_delta()
+	test_genome_roundtrip()
+	test_evolve_xor()
+	test_evolve_driver()
+	test_summary()
+}

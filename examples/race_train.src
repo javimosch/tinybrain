@@ -1,0 +1,32 @@
+// Train an oval-circuit driver by neuroevolution, save the champion artifact.
+// Run: machin encode src/tinybrain.src src/evolve.src src/racesim.src examples/race_train.src > /tmp/rt.mfl && machin run /tmp/rt.mfl
+// Outputs: models/driver.json (the artifact the M2 game loads) + models/race_train.jsonl (per-generation log)
+
+func main() {
+	t := track_default()
+	n := net_new([]int{6, 8, 2}, []string{"tanh", "tanh"}, 42)
+	maxTicks := 2700
+	fit := func(nn) {
+		ep := sim_episode(nn, t, maxTicks)
+		f := abs(ep.progress)
+		if ep.crashed {
+			f = f - 1.0
+		}
+		return f
+	}
+	cfg := evolve_cfg_default()
+	cfg.pop = 40
+	cfg.generations = 300
+	// ~4.7 laps in 90s is the physical optimum on this track; random-luck
+	// drivers plateau around 3.3 — reaching 4.3 requires generations of refinement
+	cfg.target_fitness = 4.3 * 2.0 * pi()
+	cfg.log_path = "models/race_train.jsonl"
+	cfg.print_every = 5
+	mkdir("models")
+	t0 := now_ms()
+	res, champ := evolve_run(n, fit, cfg)
+	ms := now_ms() - t0
+	net_save(champ, "models/driver.json")
+	ep := sim_episode(champ, t, maxTicks)
+	println("{\"artifact\":\"models/driver.json\",\"log\":\"models/race_train.jsonl\",\"train_ms\":" + str(ms) + ",\"generations\":" + str(res.generations) + ",\"evals\":" + str(res.evals) + ",\"best_fitness\":" + tb_fmt(res.best_fitness) + ",\"champion\":{\"laps\":" + tb_fmt(ep.laps) + ",\"ticks\":" + str(ep.ticks) + ",\"crashed\":" + str(ep.crashed) + "}}")
+}
