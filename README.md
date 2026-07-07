@@ -4,6 +4,17 @@ Train tiny neural networks in pure [machin](https://github.com/javimosch/machin)
 
 Not a deep-learning framework. tinybrain is for **tiny goals**: game-AI controllers (cars that learn to drive a track), small classifiers (intent routing, data analysis), regressors/scorers. Generative text is out of scope, honestly and on purpose.
 
+## M2 — the game
+
+```sh
+./build.sh      # vendors static raylib 5.0 if no system one
+./race_game     # run from the repo root — loads models/driver.json
+```
+
+`game/race_game.src` is the payoff: a raylib top-down view of the same elliptical circuit, with the **evolved artifact at the wheel** — the champion (green, its 5 ray sensors drawn) plus 4 mutated variants of its genome. Crashed cars respawn and count their crashes, so the fitness differences are visible live: the champion laps cleanly at ~27 speed while a bad mutant piles up crashes. The game contains **zero training code** — it composes the unchanged `racesim.src` for physics and calls `net_load` + `net_forward`, which is the whole point of the artifact contract.
+
+Note: the GUI binary links raylib/GL/X11, so it needs a display — machin's no-dependency-binary property holds for the headless trainer, not the game.
+
 ## M1 — neuroevolution + the racing sim
 
 - **`src/evolve.src`** — a genetic-algorithm trainer over fixed-topology nets: no gradients, no labels, just a fitness closure `func(net) float`. Tournament selection, uniform crossover, per-gene mutation, elitism, early stop on a target fitness, live-tailable JSONL log (one line per generation: `{"gen":i,"best":f,"mean":f}`).
@@ -97,5 +108,5 @@ cls := net_predict_class(n, inputs)         // argmax, for classifiers
 
 ## Roadmap
 
-- **M2** — the raylib top-down racing game that loads the trained artifact.
+
 - **M3** — generalize + publish: CLI for the supervised path, intent-classifier demo, awesome-machin.

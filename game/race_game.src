@@ -1,0 +1,169 @@
+// tinybrain race — the M2 raylib game. Loads the evolved artifact
+// models/driver.json and lets it drive: the champion (green, with its ray
+// sensors drawn) plus 4 mutated variants race the same elliptical circuit the
+// headless sim trained on. Crashed cars respawn and count their crashes.
+// Build: ./build.sh   Run from the repo root: ./race_game
+
+extern "raylib" {
+	header "raylib.h"
+	link "raylib" link "GL" link "m" link "pthread" link "dl" link "rt" link "X11"
+	cstruct Color { r u8 g u8 b u8 a u8 }
+	cstruct Rectangle { x f32 y f32 width f32 height f32 }
+	cstruct Vector2 { x f32 y f32 }
+	fn InitWindow(i32, i32, string)
+	fn SetTargetFPS(i32)
+	fn WindowShouldClose() bool
+	fn BeginDrawing()
+	fn EndDrawing()
+	fn ClearBackground(Color)
+	fn CloseWindow()
+	fn DrawEllipse(i32, i32, f32, f32, Color)
+	fn DrawEllipseLines(i32, i32, f32, f32, Color)
+	fn DrawLine(i32, i32, i32, i32, Color)
+	fn DrawRectanglePro(Rectangle, Vector2, f32, Color)
+	fn DrawCircle(i32, i32, f32, Color)
+	fn DrawText(string, i32, i32, i32, Color)
+}
+
+// two-decimal display formatting for the HUD
+func fmt2(v) (s) {
+	neg := false
+	if v < 0.0 {
+		neg = true
+		v = -v
+	}
+	w := int(floor(v * 100.0 + 0.5))
+	frac := str(w % 100)
+	if len(frac) == 1 {
+		frac = "0" + frac
+	}
+	s = str(w / 100) + "." + frac
+	if neg {
+		s = "-" + s
+	}
+}
+
+// world -> screen: scale 3.2, center (500, 325), y flipped
+func scr_x(x) (v) { v = 500.0 + x * 3.2 }
+func scr_y(y) (v) { v = 325.0 - y * 3.2 }
+
+// spawn a car on the mid-line at ellipse parameter th (radians), facing ccw
+func car_at(t, th) (c) {
+	am := (t.ain + t.aout) / 2.0
+	bm := (t.bin + t.bout) / 2.0
+	c = Car{x: am * tb_cos(th), y: bm * sin(th), heading: atan2(bm * tb_cos(th), -am * sin(th)), speed: 0.0, alive: true}
+}
+
+func draw_track(t) {
+	grass := Color{30, 90, 40, 255}
+	asphalt := Color{60, 60, 65, 255}
+	line := Color{200, 200, 200, 255}
+	ClearBackground(grass)
+	DrawEllipse(500, 325, t.aout * 3.2, t.bout * 3.2, asphalt)
+	DrawEllipse(500, 325, t.ain * 3.2, t.bin * 3.2, grass)
+	DrawEllipseLines(500, 325, t.aout * 3.2, t.bout * 3.2, line)
+	DrawEllipseLines(500, 325, t.ain * 3.2, t.bin * 3.2, line)
+	// start line at the bottom of the ring
+	DrawLine(500, int(scr_y(-t.bin)), 500, int(scr_y(-t.bout)), line)
+}
+
+func draw_rays(t, c) {
+	ray := Color{255, 230, 90, 120}
+	spread := pi() / 3.0
+	k := 0
+	while k < 5 {
+		rel := -spread + float(k) * (spread / 2.0)
+		ang := c.heading + rel
+		d := ray_track(t, c.x, c.y, ang)
+		DrawLine(int(scr_x(c.x)), int(scr_y(c.y)), int(scr_x(c.x + tb_cos(ang) * d)), int(scr_y(c.y + sin(ang) * d)), ray)
+		k = k + 1
+	}
+}
+
+func draw_car(c, body) {
+	deg := -c.heading * 180.0 / pi()
+	DrawRectanglePro(Rectangle{scr_x(c.x), scr_y(c.y), 16.0, 9.0}, Vector2{8.0, 4.5}, deg, body)
+	// nose dot so the facing direction reads
+	DrawCircle(int(scr_x(c.x + tb_cos(c.heading) * 3.0)), int(scr_y(c.y + sin(c.heading) * 3.0)), 2.0, Color{255, 255, 255, 220})
+}
+
+func main() {
+	src := read_file("models/driver.json")
+	if len(src) == 0 {
+		println("models/driver.json not found — train it first:")
+		println("  machin encode src/tinybrain.src src/evolve.src src/racesim.src examples/race_train.src > /tmp/rt.mfl && machin run /tmp/rt.mfl")
+		exit(1)
+	}
+	champ := net_load("models/driver.json")
+	t := track_default()
+	tb_seed(7)
+
+	// 5 drivers: the champion + 4 mutants of its genome
+	nets := []Net{}
+	nets = append(nets, champ)
+	g := net_get_genome(champ)
+	k := 0
+	while k < 4 {
+		m := net_new(champ.topology, champ.activations, 100 + k)
+		net_set_genome(m, tb_genome_child(g, g, 0.25, 0.35))
+		nets = append(nets, m)
+		k = k + 1
+	}
+
+	cars := []Car{}
+	progress := []float{}
+	crashes := []int{}
+	i := 0
+	while i < 5 {
+		cars = append(cars, car_at(t, -pi() / 2.0 - float(i) * 0.25))
+		progress = append(progress, 0.0)
+		crashes = append(crashes, 0)
+		i = i + 1
+	}
+
+	bodies := []Color{}
+	bodies = append(bodies, Color{80, 220, 100, 255})
+	bodies = append(bodies, Color{230, 120, 80, 255})
+	bodies = append(bodies, Color{90, 160, 235, 255})
+	bodies = append(bodies, Color{235, 200, 80, 255})
+	bodies = append(bodies, Color{200, 100, 220, 255})
+
+	InitWindow(1000, 650, "tinybrain race - models/driver.json at the wheel")
+	SetTargetFPS(30)
+	hud := Color{235, 235, 235, 255}
+	dim := Color{170, 170, 170, 255}
+	for WindowShouldClose() == false {
+		// one sim tick per frame (sim dt = 1/30 s, real time at 30 fps)
+		i = 0
+		while i < 5 {
+			out := net_forward(nets[i], car_sensors(t, cars[i]))
+			c2 := car_step(t, cars[i], out[0], (out[1] + 1.0) / 2.0)
+			progress[i] = progress[i] + tb_ang_delta(cars[i].x, cars[i].y, c2.x, c2.y)
+			cars[i] = c2
+			if cars[i].alive == false {
+				crashes[i] = crashes[i] + 1
+				cars[i] = car_at(t, -pi() / 2.0 - float(i) * 0.25)
+				progress[i] = 0.0
+			}
+			i = i + 1
+		}
+		BeginDrawing()
+		draw_track(t)
+		draw_rays(t, cars[0])
+		i = 4
+		while i >= 0 {
+			draw_car(cars[i], bodies[i])
+			i = i - 1
+		}
+		DrawText("tinybrain race - a [6,8,2] net evolved by neuroevolution drives", 20, 16, 20, hud)
+		champLaps := progress[0] / (2.0 * pi())
+		DrawText("champion  laps " + fmt2(champLaps) + "  speed " + fmt2(cars[0].speed), 20, 44, 20, Color{80, 220, 100, 255})
+		i = 1
+		while i < 5 {
+			DrawText("mutant " + str(i) + "  laps " + fmt2(progress[i] / (2.0 * pi())) + "  crashes " + str(crashes[i]), 20, 44 + i * 24, 18, dim)
+			i = i + 1
+		}
+		EndDrawing()
+	}
+	CloseWindow()
+}

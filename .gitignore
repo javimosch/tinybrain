@@ -1,2 +1,4 @@
 models/
 *.mfl
+vendor/
+race_game
