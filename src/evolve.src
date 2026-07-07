@@ -13,6 +13,7 @@ type EvolveCfg struct {
 	target_fitness float
 	log_path string
 	print_every int
+	warm_start bool
 }
 
 type EvolveResult struct {
@@ -22,7 +23,7 @@ type EvolveResult struct {
 }
 
 func evolve_cfg_default() (cfg) {
-	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0}
+	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0, warm_start: false}
 }
 
 // --- genome <-> net ---
@@ -156,9 +157,20 @@ func evolve_run(n, fitfn, cfg) (res, champ) {
 	gl := net_genome_len(n)
 	pop := tb_mat_empty(0)
 	i := 0
-	while i < cfg.pop {
-		pop = append(pop, tb_genome_random(gl, 1.0))
-		i = i + 1
+	if cfg.warm_start {
+		// fine-tune mode: seed the population around n's CURRENT weights
+		// (e.g. an SGD-pretrained net) — one exact copy + mutated variants
+		g0 := net_get_genome(n)
+		pop = append(pop, tb_genome_copy(g0))
+		while i < cfg.pop - 1 {
+			pop = append(pop, tb_genome_child(g0, g0, cfg.mut_rate, cfg.mut_sigma))
+			i = i + 1
+		}
+	} else {
+		while i < cfg.pop {
+			pop = append(pop, tb_genome_random(gl, 1.0))
+			i = i + 1
+		}
 	}
 	res = EvolveResult{best_fitness: -1000000000.0, generations: 0, evals: 0}
 	logLines := []string{}

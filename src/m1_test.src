@@ -127,6 +127,42 @@ func test_evolve_xor() {
 	assert_eq_str(champ.meta.trained_by, "evolve", "champion meta stamped")
 }
 
+// warm start: fine-tuning an SGD-trained net must never end up WORSE than it
+// started (the exact copy is in the population), and should typically improve
+func test_evolve_warm_start() {
+	n := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+	// deliberately under-trained by SGD
+	net_train_sgd(n, ds, 150, 0.5)
+	fit := func(nn) {
+		mse := 0.0
+		s := 0
+		while s < 4 {
+			d := net_forward(nn, ds.x[s])[0] - ds.y[s][0]
+			mse = mse + d * d
+			s = s + 1
+		}
+		return 1.0 - mse / 4.0
+	}
+	before := fit(n)
+	cfg := evolve_cfg_default()
+	cfg.pop = 30
+	cfg.generations = 25
+	cfg.mut_sigma = 0.2
+	cfg.warm_start = true
+	res, champ := evolve_run(n, fit, cfg)
+	assert(res.best_fitness >= before, "warm start never regresses (before " + str(before) + ", after " + str(res.best_fitness) + ")")
+	assert(fit(champ) >= before, "returned champion at least as fit as the seed")
+}
+
 // THE M1 test: cars learn to lap the oval without touching the borders
 func test_evolve_driver() {
 	t := track_default()
@@ -156,6 +192,7 @@ func main() {
 	test_ang_delta()
 	test_genome_roundtrip()
 	test_evolve_xor()
+	test_evolve_warm_start()
 	test_evolve_driver()
 	test_summary()
 }
