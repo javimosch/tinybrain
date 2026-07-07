@@ -1,8 +1,18 @@
 # tinybrain
 
+**[▶ live demo — the trained net drives in your browser](https://javimosch.github.io/tinybrain/)**
+
 Train tiny neural networks in pure [machin](https://github.com/javimosch/machin) (MFL) and ship them as JSON artifacts any MFL app can embed — native games, backends, wasm.
 
 Not a deep-learning framework. tinybrain is for **tiny goals**: game-AI controllers (cars that learn to drive a track), small classifiers (intent routing, data analysis), regressors/scorers. Generative text is out of scope, honestly and on purpose.
+
+## M4 — the browser (wasm)
+
+```sh
+./web/build.sh    # MFL -> C -> wasm (needs zig); outputs docs/ for GitHub Pages
+```
+
+The same `tinybrain.src` + `racesim.src` compiled with `--target wasm`: `web/race_wasm.src` holds the fleet in package globals and exports `boot(artifact)` / `tick()` / per-car getters; a ~100-line canvas host polls and draws. **No physics or inference in JS** — the sim running in your browser is byte-for-byte the sim the net was trained on, and `driver.json` is fetched and handed to wasm at load. Deployed from `docs/` to [javimosch.github.io/tinybrain](https://javimosch.github.io/tinybrain/).
 
 ## M3 — the CLI + text classifiers
 
