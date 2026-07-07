@@ -1,0 +1,453 @@
+// tinybrain — train tiny neural networks in pure MFL, ship them as JSON artifacts.
+// M0: MLP + backprop (SGD), deterministic PRNG, artifact save/load, CSV loading.
+//
+// Artifact format (tinybrain/v1):
+// {"tinybrain":1,"topology":[2,4,1],"activations":["tanh","sigmoid"],
+//  "weights":[[...],[...]],"biases":[[...],[...]],"meta":{...}}
+// weights[l] is the layer-l matrix flattened row-major: out rows x in cols.
+
+type Meta struct {
+	trained_by string
+	seed int
+	loss float
+	epochs int
+}
+
+type Net struct {
+	tinybrain int
+	topology []int
+	activations []string
+	weights [][]float
+	biases [][]float
+	meta Meta
+}
+
+type Dataset struct {
+	x [][]float
+	y [][]float
+}
+
+// --- deterministic PRNG (minstd LCG) — reproducible runs from a seed ---
+
+var tb_rng_state = 42
+
+func tb_seed(s) {
+	if s <= 0 {
+		s = 1
+	}
+	tb_rng_state = s % 2147483647
+	if tb_rng_state == 0 {
+		tb_rng_state = 1
+	}
+}
+
+// uniform float in [0,1)
+func tb_randf() (v) {
+	tb_rng_state = (tb_rng_state * 48271) % 2147483647
+	v = float(tb_rng_state) / 2147483647.0
+}
+
+// uniform float in [a,b)
+func tb_randf_range(a, b) (v) {
+	v = a + (b - a) * tb_randf()
+}
+
+// --- activations ---
+
+func tb_tanh(x) (y) {
+	if x > 20.0 {
+		y = 1.0
+		return
+	}
+	if x < -20.0 {
+		y = -1.0
+		return
+	}
+	e := exp(2.0 * x)
+	y = (e - 1.0) / (e + 1.0)
+}
+
+func tb_sigmoid(x) (y) {
+	if x > 30.0 {
+		y = 1.0
+		return
+	}
+	if x < -30.0 {
+		y = 0.0
+		return
+	}
+	y = 1.0 / (1.0 + exp(-x))
+}
+
+func tb_act(kind, x) (y) {
+	if kind == "tanh" {
+		y = tb_tanh(x)
+		return
+	}
+	if kind == "sigmoid" {
+		y = tb_sigmoid(x)
+		return
+	}
+	if kind == "relu" {
+		y = x
+		if x < 0.0 {
+			y = 0.0
+		}
+		return
+	}
+	// "linear" (and softmax pre-normalization happens at the layer level)
+	y = x
+}
+
+// derivative expressed in terms of the ACTIVATED value a
+func tb_act_deriv(kind, a) (d) {
+	if kind == "tanh" {
+		d = 1.0 - a * a
+		return
+	}
+	if kind == "sigmoid" {
+		d = a * (1.0 - a)
+		return
+	}
+	if kind == "relu" {
+		d = 0.0
+		if a > 0.0 {
+			d = 1.0
+		}
+		return
+	}
+	d = 1.0
+}
+
+// --- network ---
+
+// topology e.g. []int{2,4,1}; activations one per non-input layer e.g. ["tanh","sigmoid"].
+// Last activation may be "softmax" (paired with cross-entropy loss in training).
+func net_new(topology, activations, seed) (n) {
+	tb_seed(seed)
+	n = Net{tinybrain: 1, topology: topology, activations: activations, meta: Meta{trained_by: "none", seed: seed, loss: 0.0, epochs: 0}}
+	l := 1
+	while l < len(topology) {
+		nin := topology[l - 1]
+		nout := topology[l]
+		scale := 1.0 / sqrt(float(nin))
+		w := []float{}
+		i := 0
+		while i < nin * nout {
+			w = append(w, tb_randf_range(-scale, scale))
+			i = i + 1
+		}
+		b := []float{}
+		j := 0
+		while j < nout {
+			b = append(b, 0.0)
+			j = j + 1
+		}
+		n.weights = append(n.weights, w)
+		n.biases = append(n.biases, b)
+		l = l + 1
+	}
+}
+
+// forward pass returning the activations of EVERY layer (index 0 = input copy).
+func net_forward_all(n, x) (acts) {
+	a := []float{}
+	for _, v := range x {
+		a = append(a, v)
+	}
+	acts = append(acts, a)
+	l := 0
+	while l < len(n.weights) {
+		nin := n.topology[l]
+		nout := n.topology[l + 1]
+		kind := n.activations[l]
+		w := n.weights[l]
+		b := n.biases[l]
+		out := []float{}
+		j := 0
+		while j < nout {
+			z := b[j]
+			i := 0
+			while i < nin {
+				z = z + w[j * nin + i] * a[i]
+				i = i + 1
+			}
+			out = append(out, tb_act(kind, z))
+			j = j + 1
+		}
+		if kind == "softmax" {
+			out = tb_softmax(out)
+		}
+		acts = append(acts, out)
+		a = out
+		l = l + 1
+	}
+}
+
+// numerically-stable softmax over raw (linear) layer outputs
+func tb_softmax(z) (out) {
+	mx := z[0]
+	for _, v := range z {
+		if v > mx {
+			mx = v
+		}
+	}
+	sum := 0.0
+	for _, v := range z {
+		sum = sum + exp(v - mx)
+	}
+	for _, v := range z {
+		out = append(out, exp(v - mx) / sum)
+	}
+}
+
+// plain inference: input vector -> output vector
+func net_forward(n, x) (out) {
+	acts := net_forward_all(n, x)
+	out = acts[len(acts) - 1]
+}
+
+// index of the max output — the predicted class
+func net_predict_class(n, x) (cls) {
+	out := net_forward(n, x)
+	cls = 0
+	best := out[0]
+	i := 1
+	while i < len(out) {
+		if out[i] > best {
+			best = out[i]
+			cls = i
+		}
+		i = i + 1
+	}
+}
+
+// a slice of n empty float rows ([][]float literals aren't expressible inline)
+func tb_mat_empty(nl) (m) {
+	l := 0
+	while l < nl {
+		m = append(m, []float{})
+		l = l + 1
+	}
+}
+
+// --- training: online SGD backprop ---
+// Mutates n's weights/biases in place (slices share backing storage).
+// Loss: cross-entropy when the output activation is "softmax", else MSE.
+// Returns the mean loss of the FINAL epoch.
+func net_train_sgd(n, ds, epochs, lr) (finalLoss) {
+	nl := len(n.weights)
+	ep := 0
+	while ep < epochs {
+		epLoss := 0.0
+		s := 0
+		while s < len(ds.x) {
+			arena {
+				acts := net_forward_all(n, ds.x[s])
+				y := ds.y[s]
+				out := acts[nl]
+				outKind := n.activations[nl - 1]
+				// output deltas
+				deltas := tb_mat_empty(nl)
+				dOut := []float{}
+				j := 0
+				while j < len(out) {
+					if outKind == "softmax" {
+						dOut = append(dOut, out[j] - y[j])
+						if y[j] > 0.5 {
+							p := out[j]
+							if p < 0.000000000001 {
+								p = 0.000000000001
+							}
+							epLoss = epLoss - log(p)
+						}
+					} else {
+						diff := out[j] - y[j]
+						dOut = append(dOut, diff * tb_act_deriv(outKind, out[j]))
+						epLoss = epLoss + 0.5 * diff * diff
+					}
+					j = j + 1
+				}
+				deltas[nl - 1] = dOut
+				// hidden deltas, back to front
+				l := nl - 2
+				while l >= 0 {
+					nout := n.topology[l + 1]
+					nnext := n.topology[l + 2]
+					wnext := n.weights[l + 1]
+					dnext := deltas[l + 1]
+					kind := n.activations[l]
+					d := []float{}
+					i := 0
+					while i < nout {
+						sum := 0.0
+						k := 0
+						while k < nnext {
+							sum = sum + wnext[k * nout + i] * dnext[k]
+							k = k + 1
+						}
+						d = append(d, sum * tb_act_deriv(kind, acts[l + 1][i]))
+						i = i + 1
+					}
+					deltas[l] = d
+					l = l - 1
+				}
+				// gradient step
+				l = 0
+				while l < nl {
+					nin := n.topology[l]
+					nout := n.topology[l + 1]
+					w := n.weights[l]
+					b := n.biases[l]
+					aPrev := acts[l]
+					d := deltas[l]
+					j2 := 0
+					while j2 < nout {
+						i2 := 0
+						while i2 < nin {
+							w[j2 * nin + i2] = w[j2 * nin + i2] - lr * d[j2] * aPrev[i2]
+							i2 = i2 + 1
+						}
+						b[j2] = b[j2] - lr * d[j2]
+						j2 = j2 + 1
+					}
+					l = l + 1
+				}
+			}
+			s = s + 1
+		}
+		finalLoss = epLoss / float(len(ds.x))
+		ep = ep + 1
+	}
+}
+
+// --- artifact save/load ---
+
+// full-precision float -> decimal string (json() only keeps 6 significant digits).
+// 12 fractional digits: exact enough that a save/load round-trip is behavior-identical.
+func tb_fmt(v) (s) {
+	neg := false
+	if v < 0.0 {
+		neg = true
+		v = -v
+	}
+	if v > 1000000000000000.0 {
+		// out of sane weight range; %g is the best we can do
+		s = str(v)
+		if neg {
+			s = "-" + s
+		}
+		return
+	}
+	v = v + 0.0000000000005
+	ip := floor(v)
+	fr := v - ip
+	fs := ""
+	i := 0
+	while i < 12 {
+		fr = fr * 10.0
+		d := int(floor(fr))
+		if d > 9 {
+			d = 9
+		}
+		fs = fs + str(d)
+		fr = fr - floor(fr)
+		i = i + 1
+	}
+	// trim trailing zeros
+	while len(fs) > 1 && has_suffix(fs, "0") {
+		fs = substr(fs, 0, len(fs) - 1)
+	}
+	s = str(int(ip))
+	if fs != "0" {
+		s = s + "." + fs
+	}
+	if neg && (ip > 0.0 || fs != "0") {
+		s = "-" + s
+	}
+}
+
+func tb_vec_json(v) (s) {
+	parts := []string{}
+	for _, x := range v {
+		parts = append(parts, tb_fmt(x))
+	}
+	s = "[" + join(parts, ",") + "]"
+}
+
+func tb_mat_json(m) (s) {
+	parts := []string{}
+	for _, row := range m {
+		parts = append(parts, tb_vec_json(row))
+	}
+	s = "[" + join(parts, ",") + "]"
+}
+
+func net_json(n) (s) {
+	s = "{\"tinybrain\":1,\"topology\":" + json(n.topology) + ",\"activations\":" + json(n.activations) + ",\"weights\":" + tb_mat_json(n.weights) + ",\"biases\":" + tb_mat_json(n.biases) + ",\"meta\":" + json(n.meta) + "}"
+}
+
+func net_save(n, path) (ok) {
+	ok = write_file(path, net_json(n))
+}
+
+func net_load(path) (n) {
+	s := read_file(path)
+	n = parse(s, Net{})
+}
+
+// --- CSV: rows of nin input floats followed by nout output floats ---
+
+func csv_load(path, nin, nout) (ds) {
+	ds = Dataset{}
+	txt := read_file(path)
+	lines := split(trim(txt), "\n")
+	for _, line := range lines {
+		line = trim(line)
+		if len(line) == 0 || has_prefix(line, "#") {
+			continue
+		}
+		cols := split(line, ",")
+		if len(cols) < nin + nout {
+			continue
+		}
+		xrow := []float{}
+		i := 0
+		while i < nin {
+			xrow = append(xrow, parse_float(trim(cols[i])))
+			i = i + 1
+		}
+		yrow := []float{}
+		j := 0
+		while j < nout {
+			yrow = append(yrow, parse_float(trim(cols[nin + j])))
+			j = j + 1
+		}
+		ds.x = append(ds.x, xrow)
+		ds.y = append(ds.y, yrow)
+	}
+}
+
+// classification accuracy of n over a one-hot dataset
+func net_accuracy(n, ds) (acc) {
+	hits := 0
+	s := 0
+	while s < len(ds.x) {
+		cls := net_predict_class(n, ds.x[s])
+		want := 0
+		best := ds.y[s][0]
+		j := 1
+		while j < len(ds.y[s]) {
+			if ds.y[s][j] > best {
+				best = ds.y[s][j]
+				want = j
+			}
+			j = j + 1
+		}
+		if cls == want {
+			hits = hits + 1
+		}
+		s = s + 1
+	}
+	acc = float(hits) / float(len(ds.x))
+}

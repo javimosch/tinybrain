@@ -1,0 +1,145 @@
+// tinybrain M0 test suite — run with: machin test src/tinybrain.src src/tinybrain_test.src
+
+func approx(a, b, eps) (ok) {
+	ok = abs(a - b) < eps
+}
+
+func test_prng() {
+	tb_seed(42)
+	a := tb_randf()
+	b := tb_randf()
+	tb_seed(42)
+	a2 := tb_randf()
+	b2 := tb_randf()
+	assert(a == a2 && b == b2, "prng deterministic from seed")
+	assert(a != b, "prng advances")
+	i := 0
+	okRange := true
+	while i < 1000 {
+		v := tb_randf()
+		if v < 0.0 || v >= 1.0 {
+			okRange = false
+		}
+		i = i + 1
+	}
+	assert(okRange, "prng stays in [0,1)")
+}
+
+func test_fmt() {
+	assert_eq_str(tb_fmt(0.0), "0", "fmt zero")
+	assert_eq_str(tb_fmt(1.5), "1.5", "fmt simple")
+	assert_eq_str(tb_fmt(-0.25), "-0.25", "fmt negative")
+	v := 0.123456789012
+	r := parse_float(tb_fmt(v))
+	assert(approx(r, v, 0.000000000002), "fmt round-trips 12 digits")
+	v2 := -123.000000456
+	r2 := parse_float(tb_fmt(v2))
+	assert(approx(r2, v2, 0.000000000002), "fmt round-trips negative with int part")
+}
+
+func test_forward_manual() {
+	n := net_new([]int{2, 2, 1}, []string{"linear", "linear"}, 1)
+	// layer 0: out0 = 1*x0 + 2*x1 + 0.5 ; out1 = -1*x0 + 1*x1 - 0.5
+	n.weights[0][0] = 1.0
+	n.weights[0][1] = 2.0
+	n.weights[0][2] = -1.0
+	n.weights[0][3] = 1.0
+	n.biases[0][0] = 0.5
+	n.biases[0][1] = -0.5
+	// layer 1: out = 3*h0 - 2*h1 + 1
+	n.weights[1][0] = 3.0
+	n.weights[1][1] = -2.0
+	n.biases[1][0] = 1.0
+	out := net_forward(n, []float{1.0, 2.0})
+	// h0 = 1+4+0.5 = 5.5 ; h1 = -1+2-0.5 = 0.5 ; out = 16.5 - 1 + 1 = 16.5
+	assert(approx(out[0], 16.5, 0.000001), "manual forward computes 16.5")
+}
+
+func test_xor() {
+	n := net_new([]int{2, 4, 1}, []string{"tanh", "sigmoid"}, 42)
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+	loss := net_train_sgd(n, ds, 3000, 0.5)
+	assert(loss < 0.01, "xor final loss < 0.01 (got " + str(loss) + ")")
+	assert(net_forward(n, []float{0.0, 0.0})[0] < 0.2, "xor 0,0 -> low")
+	assert(net_forward(n, []float{0.0, 1.0})[0] > 0.8, "xor 0,1 -> high")
+	assert(net_forward(n, []float{1.0, 0.0})[0] > 0.8, "xor 1,0 -> high")
+	assert(net_forward(n, []float{1.0, 1.0})[0] < 0.2, "xor 1,1 -> low")
+}
+
+func test_artifact_roundtrip() {
+	n := net_new([]int{3, 5, 2}, []string{"relu", "sigmoid"}, 7)
+	n.meta.trained_by = "sgd"
+	n.meta.epochs = 123
+	n.meta.loss = 0.0042
+	path := "/tmp/tinybrain_test_model.json"
+	ok := net_save(n, path)
+	assert(ok >= 0, "artifact written")
+	m := net_load(path)
+	remove(path)
+	assert_eq_int(m.tinybrain, 1, "artifact version")
+	assert_eq_int(m.topology[1], 5, "topology survives")
+	assert_eq_str(m.activations[0], "relu", "activations survive")
+	assert_eq_str(m.meta.trained_by, "sgd", "meta survives")
+	assert_eq_int(m.meta.epochs, 123, "meta epochs survive")
+	// behavior-identical: same outputs on probe inputs
+	same := true
+	t := 0
+	while t < 20 {
+		x := []float{tb_randf_range(-2.0, 2.0), tb_randf_range(-2.0, 2.0), tb_randf_range(-2.0, 2.0)}
+		a := net_forward(n, x)
+		b := net_forward(m, x)
+		if approx(a[0], b[0], 0.000000001) == false || approx(a[1], b[1], 0.000000001) == false {
+			same = false
+		}
+		t = t + 1
+	}
+	assert(same, "loaded net is behavior-identical to saved net")
+}
+
+// three 2D gaussian-ish blobs -> CSV -> csv_load -> softmax classifier
+func test_csv_classification() {
+	tb_seed(1234)
+	lines := []string{"# x,y,onehot0,onehot1,onehot2"}
+	centers := []float{0.0, 0.0, 3.0, 3.0, 0.0, 3.5}
+	c := 0
+	while c < 3 {
+		i := 0
+		while i < 30 {
+			x := centers[c * 2] + tb_randf_range(-0.8, 0.8)
+			y := centers[c * 2 + 1] + tb_randf_range(-0.8, 0.8)
+			oh := []string{"0", "0", "0"}
+			oh[c] = "1"
+			lines = append(lines, tb_fmt(x) + "," + tb_fmt(y) + "," + join(oh, ","))
+			i = i + 1
+		}
+		c = c + 1
+	}
+	path := "/tmp/tinybrain_test_blobs.csv"
+	write_file(path, join(lines, "\n"))
+	ds := csv_load(path, 2, 3)
+	remove(path)
+	assert_eq_int(len(ds.x), 90, "csv loads 90 rows (comment skipped)")
+	assert_eq_int(len(ds.y[0]), 3, "csv one-hot width 3")
+	n := net_new([]int{2, 8, 3}, []string{"tanh", "softmax"}, 42)
+	loss := net_train_sgd(n, ds, 300, 0.05)
+	acc := net_accuracy(n, ds)
+	assert(acc > 0.95, "blobs classifier accuracy > 0.95 (got " + str(acc) + ", loss " + str(loss) + ")")
+}
+
+func main() {
+	test_prng()
+	test_fmt()
+	test_forward_manual()
+	test_xor()
+	test_artifact_roundtrip()
+	test_csv_classification()
+	test_summary()
+}

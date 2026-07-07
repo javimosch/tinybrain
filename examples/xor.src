@@ -1,0 +1,36 @@
+// XOR demo — train, save the artifact, reload it, predict.
+// Run: machin encode src/tinybrain.src examples/xor.src > /tmp/xor.mfl && machin run /tmp/xor.mfl
+
+func main() {
+	n := net_new([]int{2, 4, 1}, []string{"tanh", "sigmoid"}, 42)
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+
+	t0 := now_ms()
+	loss := net_train_sgd(n, ds, 3000, 0.5)
+	ms := now_ms() - t0
+	n.meta.trained_by = "sgd"
+	n.meta.epochs = 3000
+	n.meta.loss = loss
+
+	mkdir("models")
+	net_save(n, "models/xor.json")
+
+	// prove the artifact stands alone: reload and predict from the loaded net
+	m := net_load("models/xor.json")
+	preds := []string{}
+	s := 0
+	while s < len(ds.x) {
+		out := net_forward(m, ds.x[s])
+		preds = append(preds, "{\"x\":" + tb_vec_json(ds.x[s]) + ",\"want\":" + tb_fmt(ds.y[s][0]) + ",\"got\":" + tb_fmt(out[0]) + "}")
+		s = s + 1
+	}
+	println("{\"artifact\":\"models/xor.json\",\"loss\":" + tb_fmt(loss) + ",\"train_ms\":" + str(ms) + ",\"predictions\":[" + join(preds, ",") + "]}")
+}
