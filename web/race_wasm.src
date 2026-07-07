@@ -1,0 +1,116 @@
+// tinybrain race — the browser build. The SAME tinybrain.src + racesim.src the
+// native trainer and raylib game use, compiled MFL -> C -> wasm; a canvas host
+// (web/index.html) polls the exports below each frame and draws.
+// Build: web/build.sh (outputs docs/ for GitHub Pages)
+
+var g_nets = []Net{}
+var g_cars = []Car{}
+var g_prog = []float{}
+var g_crash = []int{}
+
+func wasm_spawn(i) (c) {
+	t := track_default()
+	th := -pi() / 2.0 - float(i) * 0.25
+	am := (t.ain + t.aout) / 2.0
+	bm := (t.bin + t.bout) / 2.0
+	c = Car{x: am * tb_cos(th), y: bm * sin(th), heading: atan2(bm * tb_cos(th), -am * sin(th)), speed: 0.0, alive: true}
+}
+
+// the host allocates a buffer, writes the artifact JSON, then calls boot(p)
+export func buf(n) (p) {
+	p = alloc(n + 1)
+}
+
+export func boot(p) (ok) {
+	src := ptr_str(p)
+	free(p)
+	champ := parse(src, Net{})
+	ok = 0
+	if champ.tinybrain != 1 {
+		return
+	}
+	tb_seed(7)
+	g_nets = []Net{}
+	g_cars = []Car{}
+	g_prog = []float{}
+	g_crash = []int{}
+	g_nets = append(g_nets, champ)
+	g := net_get_genome(champ)
+	k := 0
+	while k < 4 {
+		m := net_new(champ.topology, champ.activations, 100 + k)
+		net_set_genome(m, tb_genome_child(g, g, 0.25, 0.35))
+		g_nets = append(g_nets, m)
+		k = k + 1
+	}
+	i := 0
+	while i < 5 {
+		g_cars = append(g_cars, wasm_spawn(i))
+		g_prog = append(g_prog, 0.0)
+		g_crash = append(g_crash, 0)
+		i = i + 1
+	}
+	ok = 1
+}
+
+// one sim tick (dt = 1/30 s) for all cars; crashed cars respawn
+export func tick() {
+	t := track_default()
+	i := 0
+	while i < len(g_cars) {
+		out := net_forward(g_nets[i], car_sensors(t, g_cars[i]))
+		c2 := car_step(t, g_cars[i], out[0], (out[1] + 1.0) / 2.0)
+		g_prog[i] = g_prog[i] + tb_ang_delta(g_cars[i].x, g_cars[i].y, c2.x, c2.y)
+		g_cars[i] = c2
+		if g_cars[i].alive == false {
+			g_crash[i] = g_crash[i] + 1
+			g_cars[i] = wasm_spawn(i)
+			g_prog[i] = 0.0
+		}
+		i = i + 1
+	}
+}
+
+// --- state the host polls to draw ---
+
+export func car_count() (n) {
+	n = len(g_cars)
+}
+
+export func car_x(i) (v) {
+	v = g_cars[i].x
+}
+
+export func car_y(i) (v) {
+	v = g_cars[i].y
+}
+
+export func car_heading(i) (v) {
+	v = g_cars[i].heading
+}
+
+export func car_speed(i) (v) {
+	v = g_cars[i].speed
+}
+
+export func car_laps(i) (v) {
+	v = g_prog[i] / (2.0 * pi())
+}
+
+export func car_crashes(i) (n) {
+	n = g_crash[i]
+}
+
+// champion ray distance for sensor k (0..4), world units
+export func ray_d(k) (d) {
+	t := track_default()
+	c := g_cars[0]
+	spread := pi() / 3.0
+	d = ray_track(t, c.x, c.y, c.heading + (-spread + float(k) * (spread / 2.0)))
+}
+
+// track geometry for the host's draw code
+export func track_ain() (v) { t := track_default()  v = t.ain }
+export func track_bin() (v) { t := track_default()  v = t.bin }
+export func track_aout() (v) { t := track_default()  v = t.aout }
+export func track_bout() (v) { t := track_default()  v = t.bout }

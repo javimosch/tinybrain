@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinybrain race — a tiny neural net drives, in your browser</title>
+<style>
+  body { margin: 0; background: #14161a; color: #eaeaea; font: 15px/1.5 system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 24px 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  p { max-width: 720px; margin: 0; color: #b9bec7; text-align: center; }
+  a { color: #7dc4ff; }
+  canvas { max-width: 100%; height: auto; border-radius: 8px; }
+  #status { color: #8b93a1; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>tinybrain race</h1>
+<p>A <code>[6,8,2]</code> neural network — evolved in 7 generations by
+<a href="https://github.com/javimosch/tinybrain">tinybrain</a> (pure
+<a href="https://github.com/javimosch/machin">machin</a>/MFL) — drives the same simulation it
+was trained on, compiled to WebAssembly. Green is the champion artifact (<code>driver.json</code>,
+its 5 ray sensors drawn); the others are mutants of its genome. No JS physics: the sim below
+IS the training sim.</p>
+<canvas id="cv" width="1000" height="650"></canvas>
+<div id="status">loading…</div>
+<script type="module">
+const status = (m) => document.getElementById('status').textContent = m;
+const cv = document.getElementById('cv'), cx = cv.getContext('2d');
+const COLORS = ['#50dc64', '#e67850', '#5aa0eb', '#ebc850', '#c864dc'];
+
+try {
+  const wasiStub = new Proxy({}, { get: () => () => 0 });
+  const [wasmResp, artifact] = await Promise.all([
+    fetch('race.wasm'), (await fetch('driver.json')).text()
+  ]);
+  const { instance } = await WebAssembly.instantiate(await wasmResp.arrayBuffer(),
+    { wasi_snapshot_preview1: wasiStub, env: new Proxy({}, { get: () => () => 0 }) });
+  const ex = instance.exports;
+  ex._initialize?.();
+
+  // hand the artifact JSON to wasm: alloc, write UTF-8, boot
+  const bytes = new TextEncoder().encode(artifact);
+  const p = ex.buf(BigInt(bytes.length));
+  new Uint8Array(ex.memory.buffer).set(bytes, Number(p));
+  if (ex.boot(p) !== 1n) throw new Error('artifact rejected by boot()');
+
+  const AIN = ex.track_ain(), BIN = ex.track_bin(), AOUT = ex.track_aout(), BOUT = ex.track_bout();
+  const S = 3.2, CXX = 500, CY = 325;
+  const sx = (x) => CXX + x * S, sy = (y) => CY - y * S;
+
+  function draw() {
+    cx.fillStyle = '#1e5a28'; cx.fillRect(0, 0, 1000, 650);
+    // track ring
+    cx.fillStyle = '#3c3c41';
+    cx.beginPath(); cx.ellipse(CXX, CY, AOUT * S, BOUT * S, 0, 0, 7); cx.fill();
+    cx.fillStyle = '#1e5a28';
+    cx.beginPath(); cx.ellipse(CXX, CY, AIN * S, BIN * S, 0, 0, 7); cx.fill();
+    cx.strokeStyle = '#c8c8c8'; cx.lineWidth = 1.5;
+    cx.beginPath(); cx.ellipse(CXX, CY, AOUT * S, BOUT * S, 0, 0, 7); cx.stroke();
+    cx.beginPath(); cx.ellipse(CXX, CY, AIN * S, BIN * S, 0, 0, 7); cx.stroke();
+    cx.beginPath(); cx.moveTo(CXX, sy(-BIN)); cx.lineTo(CXX, sy(-BOUT)); cx.stroke();
+    // champion rays
+    const hx = ex.car_x(0n), hy = ex.car_y(0n), hh = ex.car_heading(0n);
+    cx.strokeStyle = 'rgba(255,230,90,0.45)'; cx.lineWidth = 1;
+    for (let k = 0; k < 5; k++) {
+      const a = hh + (-Math.PI / 3 + k * Math.PI / 6), d = ex.ray_d(BigInt(k));
+      cx.beginPath(); cx.moveTo(sx(hx), sy(hy));
+      cx.lineTo(sx(hx + Math.cos(a) * d), sy(hy + Math.sin(a) * d)); cx.stroke();
+    }
+    // cars (champion last, on top)
+    for (let i = 4; i >= 0; i--) {
+      const x = ex.car_x(BigInt(i)), y = ex.car_y(BigInt(i)), h = ex.car_heading(BigInt(i));
+      cx.save(); cx.translate(sx(x), sy(y)); cx.rotate(-h);
+      cx.fillStyle = COLORS[i]; cx.fillRect(-8, -4.5, 16, 9);
+      cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(9, 0, 2, 0, 7); cx.fill();
+      cx.restore();
+    }
+    // HUD
+    cx.font = '16px system-ui'; cx.fillStyle = COLORS[0];
+    cx.fillText(`champion  laps ${ex.car_laps(0n).toFixed(2)}  speed ${ex.car_speed(0n).toFixed(1)}`, 20, 30);
+    cx.fillStyle = '#aaa'; cx.font = '14px system-ui';
+    for (let i = 1; i < 5; i++)
+      cx.fillText(`mutant ${i}  laps ${ex.car_laps(BigInt(i)).toFixed(2)}  crashes ${ex.car_crashes(BigInt(i))}`, 20, 30 + i * 20);
+  }
+
+  // fixed 30 Hz sim (matches the training dt), draw on every animation frame
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    acc += now - last; last = now;
+    acc = Math.min(acc, 200);
+    while (acc >= 1000 / 30) { ex.tick(); acc -= 1000 / 30; }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  status('the artifact is driving — champion + 4 genome mutants');
+  requestAnimationFrame(frame);
+} catch (e) {
+  status('failed: ' + e.message);
+  console.error(e);
+}
+</script>
+</body>
+</html>
