@@ -1,0 +1,84 @@
+// tinybrain M3 test suite — run with: machin test src/tinybrain.src src/m3_test.src
+
+func approx(a, b, eps) (ok) {
+	ok = abs(a - b) < eps
+}
+
+func test_tokens() {
+	toks := tb_tokens("Hello, WORLD!  it's 2x fun-time")
+	assert_eq_int(len(toks), 7, "token count")
+	assert_eq_str(toks[0], "hello", "lowercased")
+	assert_eq_str(toks[2], "it", "apostrophe splits")
+	assert_eq_str(toks[4], "2x", "alnum kept")
+	assert_eq_str(toks[6], "time", "hyphen splits")
+}
+
+func test_vocab_bow() {
+	vocab := tb_vocab([]string{"hello world", "bye world bye"})
+	assert_eq_int(len(vocab), 3, "vocab dedups")
+	assert_eq_str(vocab[0], "hello", "first-appearance order 0")
+	assert_eq_str(vocab[1], "world", "first-appearance order 1")
+	assert_eq_str(vocab[2], "bye", "first-appearance order 2")
+	v := tb_bow(vocab, "BYE world unknownword")
+	assert(approx(v[0], 0.0, 0.001), "absent word 0")
+	assert(approx(v[1], 1.0, 0.001), "present word 1")
+	assert(approx(v[2], 1.0, 0.001), "present word (case-folded)")
+	assert_eq_int(len(v), 3, "bow width = vocab size")
+}
+
+func test_vocab_labels_artifact() {
+	n := net_new([]int{3, 2}, []string{"softmax"}, 5)
+	n.vocab = []string{"aa", "bb", "cc"}
+	n.labels = []string{"yes", "no"}
+	path := "/tmp/tinybrain_m3_model.json"
+	net_save(n, path)
+	m := net_load(path)
+	remove(path)
+	assert_eq_int(len(m.vocab), 3, "vocab survives artifact round-trip")
+	assert_eq_str(m.vocab[2], "cc", "vocab content survives")
+	assert_eq_str(m.labels[0], "yes", "labels survive")
+	// old artifacts without vocab/labels still load
+	legacy := "{\"tinybrain\":1,\"topology\":[1,1],\"activations\":[\"linear\"],\"weights\":[[1]],\"biases\":[[0]],\"meta\":{\"trained_by\":\"sgd\",\"seed\":1,\"loss\":0,\"epochs\":1}}"
+	write_file(path, legacy)
+	old := net_load(path)
+	remove(path)
+	assert_eq_int(len(old.vocab), 0, "legacy artifact loads with empty vocab")
+	assert(approx(net_forward(old, []float{2.0})[0], 2.0, 0.000001), "legacy artifact still infers")
+}
+
+func test_classify_text() {
+	// tiny separable intent set: train to 100% and check unseen phrasings
+	labels := []string{"yes", "no"}
+	texts := []string{"yes sure ok", "ok fine yes", "sure thing", "absolutely ok", "no way", "nope never", "no thanks", "never ever no"}
+	vocab := tb_vocab(texts)
+	ds := Dataset{}
+	i := 0
+	while i < len(texts) {
+		ds.x = append(ds.x, tb_bow(vocab, texts[i]))
+		y := []float{1.0, 0.0}
+		if i >= 4 {
+			y = []float{0.0, 1.0}
+		}
+		ds.y = append(ds.y, y)
+		i = i + 1
+	}
+	n := net_new([]int{len(vocab), 2}, []string{"softmax"}, 42)
+	n.vocab = vocab
+	n.labels = labels
+	net_train_sgd(n, ds, 500, 0.3)
+	assert(net_accuracy(n, ds) > 0.99, "separable set trains to 100%")
+	l1, c1 := net_classify_text(n, "ok sure!")
+	assert_eq_str(l1, "yes", "unseen yes-phrase routes to yes")
+	assert(c1 > 0.5, "yes confidence > 0.5")
+	l2, c2 := net_classify_text(n, "never, no way")
+	assert_eq_str(l2, "no", "unseen no-phrase routes to no")
+	assert(c2 > 0.5, "no confidence > 0.5")
+}
+
+func main() {
+	test_tokens()
+	test_vocab_bow()
+	test_vocab_labels_artifact()
+	test_classify_text()
+	test_summary()
+}

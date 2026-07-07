@@ -1,0 +1,179 @@
+// tinybrain CLI — the agent-first supervised path (M3).
+// Build: machin encode src/tinybrain.src src/cli.src > tinybrain.mfl && machin build tinybrain.mfl -o tinybrain
+// All output is JSON. The evolve trainer is deliberately NOT here: its fitness
+// function is code (a simulation), so it is a library API — see src/evolve.src.
+
+func cli_flag(name, def) (v) {
+	v = def
+	a := args()
+	i := 0
+	while i < len(a) - 1 {
+		if a[i] == "--" + name {
+			v = a[i + 1]
+		}
+		i = i + 1
+	}
+}
+
+func cli_ints(csv) (xs) {
+	xs = []int{}
+	for _, p := range split(csv, ",") {
+		xs = append(xs, parse_int(trim(p)))
+	}
+}
+
+func cli_floats(csv) (xs) {
+	xs = []float{}
+	for _, p := range split(csv, ",") {
+		xs = append(xs, parse_float(trim(p)))
+	}
+}
+
+func cli_die(msg) {
+	println("{\"error\":" + json(msg) + "}")
+	exit(1)
+}
+
+func cmd_train() {
+	data := cli_flag("data", "")
+	topoS := cli_flag("topology", "")
+	if len(data) == 0 || len(topoS) == 0 {
+		cli_die("train needs --data <csv> and --topology <i,h,...,o>; see: tinybrain guide")
+	}
+	topo := cli_ints(topoS)
+	acts := split(cli_flag("activations", ""), ",")
+	if len(cli_flag("activations", "")) == 0 {
+		// default: tanh hidden layers, softmax output
+		acts = []string{}
+		l := 1
+		while l < len(topo) - 1 {
+			acts = append(acts, "tanh")
+			l = l + 1
+		}
+		acts = append(acts, "softmax")
+	}
+	if len(acts) != len(topo) - 1 {
+		cli_die("need one activation per non-input layer (" + str(len(topo) - 1) + ", got " + str(len(acts)) + ")")
+	}
+	epochs := parse_int(cli_flag("epochs", "300"))
+	lr := parse_float(cli_flag("lr", "0.05"))
+	seed := parse_int(cli_flag("seed", "42"))
+	out := cli_flag("out", "model.json")
+	nin := topo[0]
+	nout := topo[len(topo) - 1]
+	ds := csv_load(data, nin, nout)
+	if len(ds.x) == 0 {
+		cli_die("no rows loaded from " + data + " (expected " + str(nin + nout) + " comma-separated floats per row)")
+	}
+	n := net_new(topo, acts, seed)
+	t0 := now_ms()
+	loss := net_train_sgd(n, ds, epochs, lr)
+	ms := now_ms() - t0
+	n.meta.trained_by = "sgd"
+	n.meta.epochs = epochs
+	n.meta.loss = loss
+	net_save(n, out)
+	acc := net_accuracy(n, ds)
+	println("{\"artifact\":" + json(out) + ",\"rows\":" + str(len(ds.x)) + ",\"epochs\":" + str(epochs) + ",\"loss\":" + tb_fmt(loss) + ",\"train_accuracy\":" + tb_fmt(acc) + ",\"train_ms\":" + str(ms) + "}")
+}
+
+func cmd_predict() {
+	model := cli_flag("model", "")
+	if len(model) == 0 {
+		cli_die("predict needs --model <artifact.json> and --input <f,f,...> or --text \"...\"")
+	}
+	n := net_load(model)
+	if n.tinybrain != 1 {
+		cli_die("not a tinybrain artifact: " + model)
+	}
+	text := cli_flag("text", "")
+	inS := cli_flag("input", "")
+	x := []float{}
+	if len(text) > 0 {
+		if len(n.vocab) == 0 {
+			cli_die("--text needs an artifact with a vocab (a text classifier); this one has none")
+		}
+		x = tb_bow(n.vocab, text)
+	} else {
+		if len(inS) == 0 {
+			cli_die("predict needs --input <f,f,...> or --text \"...\"")
+		}
+		x = cli_floats(inS)
+	}
+	if len(x) != n.topology[0] {
+		cli_die("input size " + str(len(x)) + " != model input size " + str(n.topology[0]))
+	}
+	out := net_forward(n, x)
+	cls := 0
+	best := out[0]
+	i := 1
+	while i < len(out) {
+		if out[i] > best {
+			best = out[i]
+			cls = i
+		}
+		i = i + 1
+	}
+	s := "{\"output\":" + tb_vec_json(out) + ",\"class\":" + str(cls)
+	if len(n.labels) > cls {
+		s = s + ",\"label\":" + json(n.labels[cls])
+	}
+	println(s + ",\"confidence\":" + tb_fmt(best) + "}")
+}
+
+func cmd_eval() {
+	model := cli_flag("model", "")
+	data := cli_flag("data", "")
+	if len(model) == 0 || len(data) == 0 {
+		cli_die("eval needs --model <artifact.json> and --data <csv>")
+	}
+	n := net_load(model)
+	if n.tinybrain != 1 {
+		cli_die("not a tinybrain artifact: " + model)
+	}
+	nout := n.topology[len(n.topology) - 1]
+	ds := csv_load(data, n.topology[0], nout)
+	if len(ds.x) == 0 {
+		cli_die("no rows loaded from " + data)
+	}
+	println("{\"accuracy\":" + tb_fmt(net_accuracy(n, ds)) + ",\"rows\":" + str(len(ds.x)) + "}")
+}
+
+func cmd_guide() {
+	g := "{\"tinybrain\":\"train tiny neural networks in pure MFL; ship them as JSON artifacts\","
+	g = g + "\"artifact\":{\"format\":\"tinybrain/v1\",\"fields\":\"topology, activations (tanh|sigmoid|relu|linear|softmax, one per non-input layer), weights (row-major out x in per layer), biases, vocab+labels (optional, text classifiers), meta\"},"
+	g = g + "\"commands\":["
+	g = g + "{\"name\":\"train\",\"usage\":\"tinybrain train --data d.csv --topology 4,8,3 [--activations tanh,softmax] [--epochs 300] [--lr 0.05] [--seed 42] [--out model.json]\",\"summary\":\"SGD backprop on a CSV of nin input floats + nout output floats per row (one-hot for classes); default activations = tanh hidden + softmax output\"},"
+	g = g + "{\"name\":\"predict\",\"usage\":\"tinybrain predict --model m.json --input 1.5,2.0 | --text \\\"some sentence\\\"\",\"summary\":\"forward pass; --text uses the artifact's bag-of-words vocab and returns the argmax label\"},"
+	g = g + "{\"name\":\"eval\",\"usage\":\"tinybrain eval --model m.json --data d.csv\",\"summary\":\"classification accuracy on a dataset\"},"
+	g = g + "{\"name\":\"guide\",\"usage\":\"tinybrain guide\",\"summary\":\"this catalog\"}],"
+	g = g + "\"library\":\"the evolve trainer (neuroevolution: GA + fitness closure, for game AI / control) is library-only because fitness is code — compose src/tinybrain.src + src/evolve.src with your program; see the repo README and SKILL.md\","
+	g = g + "\"determinism\":\"same seed -> same artifact (minstd PRNG); training runs are reproducible\"}"
+	println(g)
+}
+
+func main() {
+	a := args()
+	// args()[0] is the program name
+	if len(a) < 2 {
+		cli_die("usage: tinybrain <train|predict|eval|guide>; run: tinybrain guide")
+	}
+	cmd := a[1]
+	if cmd == "train" {
+		cmd_train()
+		return
+	}
+	if cmd == "predict" {
+		cmd_predict()
+		return
+	}
+	if cmd == "eval" {
+		cmd_eval()
+		return
+	}
+	if cmd == "guide" {
+		cmd_guide()
+		return
+	}
+	cli_die("unknown command \"" + cmd + "\"; run: tinybrain guide")
+}

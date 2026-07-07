@@ -4,6 +4,23 @@ Train tiny neural networks in pure [machin](https://github.com/javimosch/machin)
 
 Not a deep-learning framework. tinybrain is for **tiny goals**: game-AI controllers (cars that learn to drive a track), small classifiers (intent routing, data analysis), regressors/scorers. Generative text is out of scope, honestly and on purpose.
 
+## M3 — the CLI + text classifiers
+
+```sh
+machin encode src/tinybrain.src src/cli.src > tb.mfl && machin build tb.mfl -o tinybrain
+
+tinybrain guide                                                  # JSON catalog (agent-first)
+tinybrain train --data blobs.csv --topology 2,8,3 --out m.json   # {"loss":0.00029,"train_accuracy":1,"train_ms":13}
+tinybrain predict --model m.json --input 3.1,2.9                 # {"output":[...],"class":1,...}
+tinybrain eval --model m.json --data blobs.csv                   # {"accuracy":1,"rows":90}
+tinybrain predict --model models/intents.json --text "how much is the pro tier"
+#   {"output":[...],"class":1,"label":"pricing","confidence":0.9998}
+```
+
+The CLI covers the supervised path only — the evolve trainer's fitness function is *code* (a simulation), so it stays a library API by design.
+
+**Text classification** (the honest version of "a simple chatbot"): the artifact optionally carries `vocab` + `labels`, so a bag-of-words intent classifier is fully self-contained — `net_load` + `net_classify_text(n, "free text")` and nothing else. `examples/intent.src` trains a 4-intent support router (greeting/pricing/cancel/human, 36 phrases, 38ms) that routes 4/4 unseen phrasings correctly. Two lessons baked into the library: filter stopwords out of the vocab (`tb_vocab_drop(tb_vocab(texts), tb_stopwords_en())` — otherwise function words carry class weight), and fix misroutes by adding a phrasing to the dataset, not by tuning knobs.
+
 ## M2 — the game
 
 ```sh
@@ -104,9 +121,9 @@ cls := net_predict_class(n, inputs)         // argmax, for classifiers
 | `net_save(n, path)` / `net_load(path)` | artifact I/O |
 | `csv_load(path, nin, nout)` | CSV → `Dataset{x, y}` |
 | `net_accuracy(n, ds)` | classification accuracy vs one-hot labels |
-| `tb_seed(s)` / `tb_randf()` | the deterministic PRNG (minstd LCG) |
+|  `tb_seed(s)` / `tb_randf()` | the deterministic PRNG (minstd LCG) |
 
-## Roadmap
+## Status
 
 
-- **M3** — generalize + publish: CLI for the supervised path, intent-classifier demo, awesome-machin.
+M0–M3 complete. Ideas beyond: more activations/optimizers if a dogfood app needs them, a wasm inference demo, more sims for the evolve trainer.

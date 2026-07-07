@@ -1,0 +1,62 @@
+// Intent classifier — the honest version of "a simple chatbot": bag-of-words
+// -> softmax intent, with the vocab + labels carried INSIDE the artifact, so
+// a consumer only needs net_load + net_classify_text (or the CLI's --text).
+// Run: machin encode src/tinybrain.src examples/intent.src > /tmp/it.mfl && machin run /tmp/it.mfl
+
+func add_intent(texts, ys, label, phrases, nlabels, cls) (t2, y2) {
+	t2 = texts
+	y2 = ys
+	for _, p := range phrases {
+		t2 = append(t2, p)
+		oh := []float{}
+		i := 0
+		while i < nlabels {
+			v := 0.0
+			if i == cls {
+				v = 1.0
+			}
+			oh = append(oh, v)
+			i = i + 1
+		}
+		y2 = append(y2, oh)
+	}
+}
+
+func main() {
+	labels := []string{"greeting", "pricing", "cancel", "human"}
+	texts := []string{}
+	ys := tb_mat_empty(0)
+	texts, ys = add_intent(texts, ys, "greeting", []string{"hello there", "hi", "hey good morning", "good evening", "hello how are you", "hi there bot", "greetings", "hey"}, 4, 0)
+	texts, ys = add_intent(texts, ys, "pricing", []string{"how much does it cost", "what is the price", "pricing plans please", "is there a free tier", "what does the pro plan cost", "how much per month", "price list", "do you have discounts on pricing", "how much would it cost me", "price for the enterprise plan"}, 4, 1)
+	texts, ys = add_intent(texts, ys, "cancel", []string{"cancel my subscription", "i want to cancel", "how do i cancel my account", "please stop billing me", "terminate my plan", "i would like to cancel the service", "unsubscribe me", "close my account"}, 4, 2)
+	texts, ys = add_intent(texts, ys, "human", []string{"talk to a human", "i want a real person", "connect me to support staff", "can i speak with an agent", "give me a human operator", "transfer me to a person", "real human please", "speak to someone real", "i need a person not a bot", "get me someone from support"}, 4, 3)
+
+	vocab := tb_vocab_drop(tb_vocab(texts), tb_stopwords_en())
+	ds := Dataset{}
+	for _, t := range texts {
+		ds.x = append(ds.x, tb_bow(vocab, t))
+	}
+	ds.y = ys
+
+	n := net_new([]int{len(vocab), 4}, []string{"softmax"}, 42)
+	n.vocab = vocab
+	n.labels = labels
+	t0 := now_ms()
+	loss := net_train_sgd(n, ds, 1500, 0.1)
+	ms := now_ms() - t0
+	n.meta.trained_by = "sgd"
+	n.meta.epochs = 1500
+	n.meta.loss = loss
+	mkdir("models")
+	net_save(n, "models/intents.json")
+
+	// unseen phrasings, via the reloaded artifact
+	m := net_load("models/intents.json")
+	tests := []string{"hiya, morning!", "what would the enterprise plan cost me", "stop charging my card and end the plan", "put an actual person on the line"}
+	preds := []string{}
+	for _, q := range tests {
+		label, conf := net_classify_text(m, q)
+		preds = append(preds, "{\"text\":" + json(q) + ",\"intent\":" + json(label) + ",\"confidence\":" + tb_fmt(conf) + "}")
+	}
+	println("{\"artifact\":\"models/intents.json\",\"vocab_size\":" + str(len(vocab)) + ",\"train_rows\":" + str(len(ds.x)) + ",\"loss\":" + tb_fmt(loss) + ",\"train_accuracy\":" + tb_fmt(net_accuracy(n, ds)) + ",\"train_ms\":" + str(ms) + ",\"unseen\":[" + join(preds, ",") + "]}")
+}

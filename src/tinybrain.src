@@ -19,6 +19,8 @@ type Net struct {
 	activations []string
 	weights [][]float
 	biases [][]float
+	vocab []string
+	labels []string
 	meta Meta
 }
 
@@ -384,7 +386,7 @@ func tb_mat_json(m) (s) {
 }
 
 func net_json(n) (s) {
-	s = "{\"tinybrain\":1,\"topology\":" + json(n.topology) + ",\"activations\":" + json(n.activations) + ",\"weights\":" + tb_mat_json(n.weights) + ",\"biases\":" + tb_mat_json(n.biases) + ",\"meta\":" + json(n.meta) + "}"
+	s = "{\"tinybrain\":1,\"topology\":" + json(n.topology) + ",\"activations\":" + json(n.activations) + ",\"weights\":" + tb_mat_json(n.weights) + ",\"biases\":" + tb_mat_json(n.biases) + ",\"vocab\":" + json(n.vocab) + ",\"labels\":" + json(n.labels) + ",\"meta\":" + json(n.meta) + "}"
 }
 
 func net_save(n, path) (ok) {
@@ -426,6 +428,102 @@ func csv_load(path, nin, nout) (ds) {
 		ds.x = append(ds.x, xrow)
 		ds.y = append(ds.y, yrow)
 	}
+}
+
+// --- text: bag-of-words featurization (for intent classifiers) ---
+// A classifier net carries its own vocab + labels in the artifact, so a
+// consumer only needs net_load + net_classify_text.
+
+// lowercase alphanumeric tokens; everything else is a separator
+func tb_tokens(text) (toks) {
+	toks = []string{}
+	t := to_lower(text)
+	alnum := "abcdefghijklmnopqrstuvwxyz0123456789"
+	cur := ""
+	i := 0
+	while i < len(t) {
+		ch := charat(t, i)
+		if index(alnum, ch) >= 0 {
+			cur = cur + ch
+		} else {
+			if len(cur) > 0 {
+				toks = append(toks, cur)
+			}
+			cur = ""
+		}
+		i = i + 1
+	}
+	if len(cur) > 0 {
+		toks = append(toks, cur)
+	}
+}
+
+// unique tokens across texts, in order of first appearance (deterministic)
+func tb_vocab(texts) (vocab) {
+	vocab = []string{}
+	seen := make(map[string]int)
+	for _, txt := range texts {
+		for _, tok := range tb_tokens(txt) {
+			if has(seen, tok) == false {
+				seen[tok] = 1
+				vocab = append(vocab, tok)
+			}
+		}
+	}
+}
+
+// drop words from a vocab (typically stopwords, so function words carry no weight)
+func tb_vocab_drop(vocab, drop) (v) {
+	d := make(map[string]int)
+	for _, w := range drop {
+		d[w] = 1
+	}
+	v = []string{}
+	for _, w := range vocab {
+		if has(d, w) == false {
+			v = append(v, w)
+		}
+	}
+}
+
+// a minimal english stopword list for tiny intent datasets
+func tb_stopwords_en() (s) {
+	s = split("the,a,an,i,it,me,my,to,do,is,are,on,of,for,and,or,with,there,would,like,can,put,you,your", ",")
+}
+
+// binary bag-of-words vector: v[i] = 1.0 iff vocab[i] occurs in text
+func tb_bow(vocab, text) (v) {
+	idx := make(map[string]int)
+	for i, w := range vocab {
+		idx[w] = i + 1
+	}
+	v = []float{}
+	i := 0
+	while i < len(vocab) {
+		v = append(v, 0.0)
+		i = i + 1
+	}
+	for _, tok := range tb_tokens(text) {
+		if has(idx, tok) {
+			v[idx[tok] - 1] = 1.0
+		}
+	}
+}
+
+// classify raw text with a net that carries vocab+labels; returns (label, confidence)
+func net_classify_text(n, text) (label, conf) {
+	out := net_forward(n, tb_bow(n.vocab, text))
+	cls := 0
+	conf = out[0]
+	i := 1
+	while i < len(out) {
+		if out[i] > conf {
+			conf = out[i]
+			cls = i
+		}
+		i = i + 1
+	}
+	label = n.labels[cls]
 }
 
 // classification accuracy of n over a one-hot dataset
