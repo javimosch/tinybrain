@@ -163,6 +163,40 @@ func test_evolve_warm_start() {
 	assert(fit(champ) >= before, "returned champion at least as fit as the seed")
 }
 
+// parallel evaluation must be BIT-IDENTICAL to sequential (exact genome
+// transport over channels + pure fitness), so the GA trajectory is too
+func test_evolve_parallel() {
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+	fit := func(nn) {
+		mse := 0.0
+		s := 0
+		while s < 4 {
+			d := net_forward(nn, ds.x[s])[0] - ds.y[s][0]
+			mse = mse + d * d
+			s = s + 1
+		}
+		return 1.0 - mse / 4.0
+	}
+	cfg := evolve_cfg_default()
+	cfg.pop = 30
+	cfg.generations = 40
+	n1 := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	r1, _ := evolve_run(n1, fit, cfg)
+	cfg.workers = 4
+	n2 := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	r2, _ := evolve_run(n2, fit, cfg)
+	assert(f64_bits(r1.best_fitness) == f64_bits(r2.best_fitness), "parallel == sequential bit-exact (seq " + str(r1.best_fitness) + ", par " + str(r2.best_fitness) + ")")
+	assert(r1.evals == r2.evals, "same eval count")
+}
+
 // THE M1 test: cars learn to lap the oval without touching the borders
 func test_evolve_driver() {
 	t := track_default()
@@ -193,6 +227,7 @@ func main() {
 	test_genome_roundtrip()
 	test_evolve_xor()
 	test_evolve_warm_start()
+	test_evolve_parallel()
 	test_evolve_driver()
 	test_summary()
 }

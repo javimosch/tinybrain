@@ -151,6 +151,30 @@ func net_new(topology, activations, seed) (n) {
 	}
 }
 
+// a net with ZERO weights — for workers that will net_set_genome immediately.
+// Touches no global PRNG state, so it is safe to call concurrently.
+func net_zeros(topology, activations) (n) {
+	n = Net{tinybrain: 1, topology: topology, activations: activations, meta: Meta{trained_by: "none", seed: 0, loss: 0.0, epochs: 0}}
+	l := 1
+	while l < len(topology) {
+		w := []float{}
+		i := 0
+		while i < topology[l - 1] * topology[l] {
+			w = append(w, 0.0)
+			i = i + 1
+		}
+		b := []float{}
+		j := 0
+		while j < topology[l] {
+			b = append(b, 0.0)
+			j = j + 1
+		}
+		n.weights = append(n.weights, w)
+		n.biases = append(n.biases, b)
+		l = l + 1
+	}
+}
+
 // forward pass returning the activations of EVERY layer (index 0 = input copy).
 func net_forward_all(n, x) (acts) {
 	a := []float{}

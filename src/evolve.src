@@ -14,6 +14,7 @@ type EvolveCfg struct {
 	log_path string
 	print_every int
 	warm_start bool
+	workers int
 }
 
 type EvolveResult struct {
@@ -23,7 +24,7 @@ type EvolveResult struct {
 }
 
 func evolve_cfg_default() (cfg) {
-	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0, warm_start: false}
+	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0, warm_start: false, workers: 1}
 }
 
 // --- genome <-> net ---
@@ -145,6 +146,90 @@ func tb_sort_desc(fit) (order) {
 	}
 }
 
+// --- parallel fitness evaluation ---
+// cfg.workers > 1 fans evaluation out over goroutines. Genomes cross channels
+// as f64-BIT strings (a []float channel element round-trips through %g JSON —
+// lossy; strings are exact), one chunky job per worker per generation (send-
+// all-then-receive-all, deadlock-free with unbuffered channels). The fitness
+// closure runs CONCURRENTLY in every worker: it must be pure — no globals, no
+// tb_randf/tb_seed inside fitness (machin's race inference will refuse the
+// build otherwise, which is the point).
+
+func tb_pack_floats(g) (s) {
+	parts := []string{}
+	for _, v := range g {
+		parts = append(parts, str(f64_bits(v)))
+	}
+	s = join(parts, ",")
+}
+
+func tb_unpack_floats(s) (g) {
+	g = []float{}
+	for _, p := range split(s, ",") {
+		g = append(g, f64_from_bits(parse_int(p)))
+	}
+}
+
+// one persistent worker: builds its own net, evaluates every genome in each
+// job it receives ("idx|bits;idx|bits;..."), replies "idx|fitbits;..."
+func evolve_worker(fitfn, topoCsv, actsCsv, jobs, results) {
+	topo := []int{}
+	for _, p := range split(topoCsv, ",") {
+		topo = append(topo, parse_int(p))
+	}
+	n := net_zeros(topo, split(actsCsv, ","))
+	for job := range jobs {
+		outParts := []string{}
+		for _, item := range split(job, ";") {
+			bar := index(item, "|")
+			idx := substr(item, 0, bar)
+			net_set_genome(n, tb_unpack_floats(substr(item, bar + 1, len(item))))
+			v := 0.0
+			arena {
+				v = fitfn(n)
+			}
+			outParts = append(outParts, idx + "|" + str(f64_bits(v)))
+		}
+		results <- join(outParts, ";")
+	}
+}
+
+// evaluate the whole population in parallel; returns fitness by index.
+// Deterministic: fitness values are bit-identical to sequential evaluation
+// (exact genome transport + a pure fitness fn), so the GA's trajectory is too.
+func evolve_eval_par(pop, jobs, results, nworkers) (fit) {
+	fit = []float{}
+	i := 0
+	while i < len(pop) {
+		fit = append(fit, 0.0)
+		i = i + 1
+	}
+	k := 0
+	sentJobs := 0
+	while k < nworkers {
+		parts := []string{}
+		i = k
+		while i < len(pop) {
+			parts = append(parts, str(i) + "|" + tb_pack_floats(pop[i]))
+			i = i + nworkers
+		}
+		if len(parts) > 0 {
+			jobs <- join(parts, ";")
+			sentJobs = sentJobs + 1
+		}
+		k = k + 1
+	}
+	r := 0
+	while r < sentJobs {
+		res := <-results
+		for _, item := range split(res, ";") {
+			bar := index(item, "|")
+			fit[parse_int(substr(item, 0, bar))] = f64_from_bits(parse_int(substr(item, bar + 1, len(item))))
+		}
+		r = r + 1
+	}
+}
+
 // --- the trainer ---
 // Evolves genomes for n's topology, maximizing fitfn(n).
 // Returns (result, champion-net): the champion's weights are also set into the
@@ -173,22 +258,43 @@ func evolve_run(n, fitfn, cfg) (res, champ) {
 		}
 	}
 	res = EvolveResult{best_fitness: -1000000000.0, generations: 0, evals: 0}
+	// parallel evaluation: persistent workers, spawned once
+	jobs := make(chan string)
+	results := make(chan string)
+	if cfg.workers > 1 {
+		topoParts := []string{}
+		for _, tv := range n.topology {
+			topoParts = append(topoParts, str(tv))
+		}
+		topoCsv := join(topoParts, ",")
+		actsCsv := join(n.activations, ",")
+		wk := 0
+		while wk < cfg.workers {
+			go evolve_worker(fitfn, topoCsv, actsCsv, jobs, results)
+			wk = wk + 1
+		}
+	}
 	logLines := []string{}
 	gen := 0
 	while gen < cfg.generations {
 		fit := []float{}
-		i = 0
-		while i < cfg.pop {
-			v := 0.0
-			// the arena reclaims everything the episode allocates; only the
-			// scalar fitness (assigned, not allocated) may cross the boundary
-			arena {
-				net_set_genome(n, pop[i])
-				v = fitfn(n)
+		if cfg.workers > 1 {
+			fit = evolve_eval_par(pop, jobs, results, cfg.workers)
+			res.evals = res.evals + cfg.pop
+		} else {
+			i = 0
+			while i < cfg.pop {
+				v := 0.0
+				// the arena reclaims everything the episode allocates; only the
+				// scalar fitness (assigned, not allocated) may cross the boundary
+				arena {
+					net_set_genome(n, pop[i])
+					v = fitfn(n)
+				}
+				fit = append(fit, v)
+				res.evals = res.evals + 1
+				i = i + 1
 			}
-			fit = append(fit, v)
-			res.evals = res.evals + 1
-			i = i + 1
 		}
 		order := tb_sort_desc(fit)
 		best := fit[order[0]]
@@ -230,6 +336,9 @@ func evolve_run(n, fitfn, cfg) (res, champ) {
 		net_set_genome(n, champion)
 		pop = next
 		gen = gen + 1
+	}
+	if cfg.workers > 1 {
+		close(jobs)
 	}
 	n.meta.trained_by = "evolve"
 	n.meta.seed = cfg.seed
