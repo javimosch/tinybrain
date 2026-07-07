@@ -179,24 +179,35 @@ func evolve_worker(fitfn, topoCsv, actsCsv, jobs, results) {
 	}
 	n := net_zeros(topo, split(actsCsv, ","))
 	for job := range jobs {
-		outParts := []string{}
-		for _, item := range split(job, ";") {
-			bar := index(item, "|")
-			idx := substr(item, 0, bar)
-			net_set_genome(n, tb_unpack_floats(substr(item, bar + 1, len(item))))
-			v := 0.0
-			arena {
-				v = fitfn(n)
+		// everything job-scoped dies with this arena (the result is sent from
+		// inside it — channel sends deep-copy to the receiver). Received job
+		// strings still land in this goroutine's arena; evolve_run respawns
+		// workers periodically so it is reclaimed.
+		arena {
+			outParts := []string{}
+			for _, item := range split(job, ";") {
+				bar := index(item, "|")
+				idx := substr(item, 0, bar)
+				net_set_genome(n, tb_unpack_floats(substr(item, bar + 1, len(item))))
+				v := 0.0
+				arena {
+					v = fitfn(n)
+				}
+				outParts = append(outParts, idx + "|" + str(f64_bits(v)))
 			}
-			outParts = append(outParts, idx + "|" + str(f64_bits(v)))
+			results <- join(outParts, ";")
 		}
-		results <- join(outParts, ";")
 	}
 }
 
 // evaluate the whole population in parallel; returns fitness by index.
 // Deterministic: fitness values are bit-identical to sequential evaluation
 // (exact genome transport + a pure fitness fn), so the GA's trajectory is too.
+// MEMORY: the entire exchange (job strings, result strings, parsing) runs in
+// an arena — only element WRITES into the preallocated fit slice cross the
+// boundary. Without this, a long run leaks ~hundreds of KB per generation
+// into the main goroutine's never-reclaimed arena (learned the hard way:
+// 10GB RAM exhausted on a shared box).
 func evolve_eval_par(pop, jobs, results, nworkers) (fit) {
 	fit = []float{}
 	i := 0
@@ -204,29 +215,31 @@ func evolve_eval_par(pop, jobs, results, nworkers) (fit) {
 		fit = append(fit, 0.0)
 		i = i + 1
 	}
-	k := 0
-	sentJobs := 0
-	while k < nworkers {
-		parts := []string{}
-		i = k
-		while i < len(pop) {
-			parts = append(parts, str(i) + "|" + tb_pack_floats(pop[i]))
-			i = i + nworkers
+	arena {
+		k := 0
+		sentJobs := 0
+		while k < nworkers {
+			parts := []string{}
+			i = k
+			while i < len(pop) {
+				parts = append(parts, str(i) + "|" + tb_pack_floats(pop[i]))
+				i = i + nworkers
+			}
+			if len(parts) > 0 {
+				jobs <- join(parts, ";")
+				sentJobs = sentJobs + 1
+			}
+			k = k + 1
 		}
-		if len(parts) > 0 {
-			jobs <- join(parts, ";")
-			sentJobs = sentJobs + 1
+		r := 0
+		while r < sentJobs {
+			res := <-results
+			for _, item := range split(res, ";") {
+				bar := index(item, "|")
+				fit[parse_int(substr(item, 0, bar))] = f64_from_bits(parse_int(substr(item, bar + 1, len(item))))
+			}
+			r = r + 1
 		}
-		k = k + 1
-	}
-	r := 0
-	while r < sentJobs {
-		res := <-results
-		for _, item := range split(res, ";") {
-			bar := index(item, "|")
-			fit[parse_int(substr(item, 0, bar))] = f64_from_bits(parse_int(substr(item, bar + 1, len(item))))
-		}
-		r = r + 1
 	}
 }
 
@@ -258,16 +271,20 @@ func evolve_run(n, fitfn, cfg) (res, champ) {
 		}
 	}
 	res = EvolveResult{best_fitness: -1000000000.0, generations: 0, evals: 0}
-	// parallel evaluation: persistent workers, spawned once
+	// parallel evaluation: workers RESPAWN every 40 generations — a machin
+	// goroutine's arena is reclaimed only when it returns, and received job
+	// strings accumulate there; cycling the pool bounds worker memory
 	jobs := make(chan string)
 	results := make(chan string)
+	topoCsv := ""
+	actsCsv := ""
 	if cfg.workers > 1 {
 		topoParts := []string{}
 		for _, tv := range n.topology {
 			topoParts = append(topoParts, str(tv))
 		}
-		topoCsv := join(topoParts, ",")
-		actsCsv := join(n.activations, ",")
+		topoCsv = join(topoParts, ",")
+		actsCsv = join(n.activations, ",")
 		wk := 0
 		while wk < cfg.workers {
 			go evolve_worker(fitfn, topoCsv, actsCsv, jobs, results)
@@ -277,6 +294,15 @@ func evolve_run(n, fitfn, cfg) (res, champ) {
 	logLines := []string{}
 	gen := 0
 	while gen < cfg.generations {
+		if cfg.workers > 1 && gen > 0 && gen % 40 == 0 {
+			close(jobs)
+			jobs = make(chan string)
+			wk := 0
+			while wk < cfg.workers {
+				go evolve_worker(fitfn, topoCsv, actsCsv, jobs, results)
+				wk = wk + 1
+			}
+		}
 		fit := []float{}
 		if cfg.workers > 1 {
 			fit = evolve_eval_par(pop, jobs, results, cfg.workers)
