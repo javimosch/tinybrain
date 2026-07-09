@@ -15,6 +15,8 @@ type EvolveCfg struct {
 	print_every int
 	warm_start bool
 	workers int
+	es_sigma float
+	es_lr float
 }
 
 type EvolveResult struct {
@@ -24,7 +26,7 @@ type EvolveResult struct {
 }
 
 func evolve_cfg_default() (cfg) {
-	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0, warm_start: false, workers: 1}
+	cfg = EvolveCfg{pop: 60, generations: 100, elite: 4, mut_rate: 0.15, mut_sigma: 0.4, seed: 42, target_fitness: 0.0, log_path: "", print_every: 0, warm_start: false, workers: 1, es_sigma: 0.1, es_lr: 0.03}
 }
 
 // --- genome <-> net ---
@@ -367,6 +369,206 @@ func evolve_run(n, fitfn, cfg) (res, champ) {
 		close(jobs)
 	}
 	n.meta.trained_by = "evolve"
+	n.meta.seed = cfg.seed
+	n.meta.loss = -res.best_fitness
+	n.meta.epochs = res.generations
+	champ = n
+}
+
+// --- Evolution Strategy (OpenAI-ES style) ---
+// A gradient-estimate trainer: perturb a MEAN genome with antithetic Gaussian
+// pairs, rank-weight the fitnesses, step the mean along the estimated gradient.
+// Typically 2-5x more sample-efficient than the tournament GA for continuous
+// control (locomotion), and it reuses evolve_run's exact parallel worker pool
+// + arena discipline. Same (res, champ) contract as evolve_run.
+//   cfg.es_sigma = perturbation std, cfg.es_lr = step size, cfg.pop = members
+//   (rounded down to an even count of antithetic pairs).
+
+// standard normal via Box-Muller (no cos builtin: cos(x) = sin(x + pi/2)).
+// Main-goroutine only — the fitness closure in workers must stay pure.
+func tb_randn() (z) {
+	u1 := tb_randf()
+	if u1 < 0.000000000001 {
+		u1 = 0.000000000001
+	}
+	u2 := tb_randf()
+	z = sqrt(-2.0 * log(u1)) * sin(u2 * 2.0 * pi() + pi() / 2.0)
+}
+
+// centered-rank weights in [-0.5, +0.5]: best index -> +0.5, worst -> -0.5.
+// Scale-free and outlier-robust (raw fitness magnitudes never enter the step).
+func es_ranks(fit) (w) {
+	m := len(fit)
+	w = []float{}
+	i := 0
+	while i < m {
+		w = append(w, 0.0)
+		i = i + 1
+	}
+	order := tb_sort_desc(fit)
+	if m > 1 {
+		r := 0
+		while r < m {
+			w[order[r]] = 0.5 - float(r) / float(m - 1)
+			r = r + 1
+		}
+	}
+}
+
+func es_run(n, fitfn, cfg) (res, champ) {
+	tb_seed(cfg.seed)
+	gl := net_genome_len(n)
+	// mean genome (persistent outer allocation: updated by element writes so
+	// it survives the per-generation arenas)
+	mu := []float{}
+	if cfg.warm_start {
+		mu = net_get_genome(n)
+	} else {
+		i := 0
+		while i < gl {
+			mu = append(mu, tb_randn() * 0.1)
+			i = i + 1
+		}
+	}
+	bestG := tb_genome_copy(mu)
+	npairs := cfg.pop / 2
+	if npairs < 1 {
+		npairs = 1
+	}
+	sigma := cfg.es_sigma
+	res = EvolveResult{best_fitness: -1000000000.0, generations: 0, evals: 0}
+
+	// worker pool — identical to evolve_run (respawned every 40 gens)
+	jobs := make(chan string)
+	results := make(chan string)
+	topoCsv := ""
+	actsCsv := ""
+	if cfg.workers > 1 {
+		topoParts := []string{}
+		for _, tv := range n.topology {
+			topoParts = append(topoParts, str(tv))
+		}
+		topoCsv = join(topoParts, ",")
+		actsCsv = join(n.activations, ",")
+		wk := 0
+		while wk < cfg.workers {
+			go evolve_worker(fitfn, topoCsv, actsCsv, jobs, results)
+			wk = wk + 1
+		}
+	}
+
+	seq := net_zeros(n.topology, n.activations)
+	logLines := []string{}
+	gen := 0
+	while gen < cfg.generations {
+		if cfg.workers > 1 && gen > 0 && gen % 40 == 0 {
+			close(jobs)
+			jobs = make(chan string)
+			wk := 0
+			while wk < cfg.workers {
+				go evolve_worker(fitfn, topoCsv, actsCsv, jobs, results)
+				wk = wk + 1
+			}
+		}
+		best := -1000000000.0
+		improved := false
+		// per-generation transients (eps/pop/fit/ranks) live and die in this
+		// arena; only element/scalar writes into mu, bestG, res cross out
+		arena {
+			eps := tb_mat_empty(0)
+			pop := tb_mat_empty(0)
+			j := 0
+			while j < npairs {
+				e := []float{}
+				k := 0
+				while k < gl {
+					e = append(e, tb_randn())
+					k = k + 1
+				}
+				eps = append(eps, e)
+				gp := []float{}
+				gm := []float{}
+				k = 0
+				while k < gl {
+					gp = append(gp, mu[k] + sigma * e[k])
+					gm = append(gm, mu[k] - sigma * e[k])
+					k = k + 1
+				}
+				pop = append(pop, gp)
+				pop = append(pop, gm)
+				j = j + 1
+			}
+			np := len(pop)
+			fit := []float{}
+			if cfg.workers > 1 {
+				fit = evolve_eval_par(pop, jobs, results, cfg.workers)
+			} else {
+				i := 0
+				while i < np {
+					v := 0.0
+					arena {
+						net_set_genome(seq, pop[i])
+						v = fitfn(seq)
+					}
+					fit = append(fit, v)
+					i = i + 1
+				}
+			}
+			res.evals = res.evals + np
+			bi := 0
+			i := 1
+			while i < np {
+				if fit[i] > fit[bi] {
+					bi = i
+				}
+				i = i + 1
+			}
+			best = fit[bi]
+			if best > res.best_fitness {
+				improved = true
+				k := 0
+				while k < gl {
+					bestG[k] = pop[bi][k]
+					k = k + 1
+				}
+			}
+			// rank-weighted antithetic gradient step
+			w := es_ranks(fit)
+			scale := cfg.es_lr / (float(np) * sigma)
+			j = 0
+			while j < npairs {
+				wdiff := w[2 * j] - w[2 * j + 1]
+				k := 0
+				while k < gl {
+					mu[k] = mu[k] + scale * wdiff * eps[j][k]
+					k = k + 1
+				}
+				j = j + 1
+			}
+		}
+		if improved {
+			res.best_fitness = best
+		}
+		res.generations = gen + 1
+		line := "{\"gen\":" + str(gen) + ",\"best\":" + tb_fmt(best) + ",\"es_best\":" + tb_fmt(res.best_fitness) + "}"
+		logLines = append(logLines, line)
+		if len(cfg.log_path) > 0 {
+			write_file(cfg.log_path, join(logLines, "\n") + "\n")
+		}
+		if cfg.print_every > 0 && gen % cfg.print_every == 0 {
+			println(line)
+			flush()
+		}
+		if cfg.target_fitness > 0.0 && res.best_fitness >= cfg.target_fitness {
+			break
+		}
+		gen = gen + 1
+	}
+	if cfg.workers > 1 {
+		close(jobs)
+	}
+	net_set_genome(n, bestG)
+	n.meta.trained_by = "es"
 	n.meta.seed = cfg.seed
 	n.meta.loss = -res.best_fitness
 	n.meta.epochs = res.generations

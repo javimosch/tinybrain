@@ -86,15 +86,24 @@ Wanted next: a scorer inside a machin backend (e.g. lead scoring in an
 agent-first CLI), more sims pointed at `evolve_run`, a wasm-embedded classifier
 in a real page.
 
+## Delivered by consumer pull
+
+- **Parallel fitness evaluation** (`cfg.workers`) — `go`/`chan` over the
+  population, bit-identical to sequential, race-inference-verified. Pulled by
+  the [machin-walker](https://github.com/javimosch/machin-walker) locomotion
+  runs, where episodes are expensive.
+- **Evolution Strategy trainer** (`es_run`) — antithetic Gaussian sampling +
+  centered-rank-weighted gradient step on a mean genome; reuses the parallel
+  worker pool, same `(res, champ)` contract as `evolve_run`. Pulled by the
+  walker when tournament-GA proved sample-inefficient for continuous control.
+
 ## Roadmap candidates (pull, don't push)
 
 Features enter when a consumer needs them, roughly in this order of likelihood:
 
-- **Parallel fitness evaluation** — `go`/`chan` over the population; machin's
-  inferred race-freedom makes this the natural "fearless parallel training"
-  story. Needed the first time a fitness function is expensive.
-- **Sigma adaptation** for evolve (decay or 1/5-rule) — the reacher fine-tune
-  suggests it; add when a consumer measurably stalls without it.
+- **Adaptive sigma / LR** for `es_run` (decay schedule or 1/5-rule) — the fixed
+  `es_sigma`/`es_lr` are a starting point; add scheduling when a consumer
+  measurably stalls without it.
 - **A DAgger helper** — the clone→rollout→relabel→retrain loop as a framework
   function instead of app code (the arm wrote it by hand).
 - **Momentum / minibatch SGD** — when a supervised consumer outgrows online SGD.

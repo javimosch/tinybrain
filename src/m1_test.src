@@ -197,6 +197,75 @@ func test_evolve_parallel() {
 	assert(r1.evals == r2.evals, "same eval count")
 }
 
+// the ES trainer solves XOR by gradient estimate (not tournament selection)
+func test_es_xor() {
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+	fit := func(nn) {
+		mse := 0.0
+		s := 0
+		while s < 4 {
+			d := net_forward(nn, ds.x[s])[0] - ds.y[s][0]
+			mse = mse + d * d
+			s = s + 1
+		}
+		return 1.0 - mse / 4.0
+	}
+	n := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	cfg := evolve_cfg_default()
+	cfg.pop = 40
+	cfg.generations = 600
+	cfg.es_sigma = 0.15
+	cfg.es_lr = 0.06
+	cfg.target_fitness = 0.97
+	res, champ := es_run(n, fit, cfg)
+	assert(res.best_fitness > 0.95, "es solves XOR (fitness " + str(res.best_fitness) + ")")
+	assert(net_forward(champ, []float{0.0, 1.0})[0] > 0.65, "es xor 0,1 -> high")
+	assert(net_forward(champ, []float{1.0, 1.0})[0] < 0.35, "es xor 1,1 -> low")
+	assert_eq_str(champ.meta.trained_by, "es", "es champion meta stamped")
+}
+
+// es_run must be BIT-IDENTICAL across worker counts (sampling is main-goroutine
+// only; the fitness closure is pure) — the same guarantee the GA path has
+func test_es_parallel_deterministic() {
+	ds := Dataset{}
+	ds.x = append(ds.x, []float{0.0, 0.0})
+	ds.x = append(ds.x, []float{0.0, 1.0})
+	ds.x = append(ds.x, []float{1.0, 0.0})
+	ds.x = append(ds.x, []float{1.0, 1.0})
+	ds.y = append(ds.y, []float{0.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{1.0})
+	ds.y = append(ds.y, []float{0.0})
+	fit := func(nn) {
+		mse := 0.0
+		s := 0
+		while s < 4 {
+			d := net_forward(nn, ds.x[s])[0] - ds.y[s][0]
+			mse = mse + d * d
+			s = s + 1
+		}
+		return 1.0 - mse / 4.0
+	}
+	cfg := evolve_cfg_default()
+	cfg.pop = 32
+	cfg.generations = 60
+	n1 := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	r1, _ := es_run(n1, fit, cfg)
+	cfg.workers = 4
+	n2 := net_new([]int{2, 3, 1}, []string{"tanh", "sigmoid"}, 1)
+	r2, _ := es_run(n2, fit, cfg)
+	assert(f64_bits(r1.best_fitness) == f64_bits(r2.best_fitness), "es parallel == sequential bit-exact (seq " + str(r1.best_fitness) + ", par " + str(r2.best_fitness) + ")")
+	assert(r1.evals == r2.evals, "es same eval count")
+}
+
 // THE M1 test: cars learn to lap the oval without touching the borders
 func test_evolve_driver() {
 	t := track_default()
@@ -228,6 +297,8 @@ func main() {
 	test_evolve_xor()
 	test_evolve_warm_start()
 	test_evolve_parallel()
+	test_es_xor()
+	test_es_parallel_deterministic()
 	test_evolve_driver()
 	test_summary()
 }
