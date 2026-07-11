@@ -574,3 +574,141 @@ func es_run(n, fitfn, cfg) (res, champ) {
 	n.meta.epochs = res.generations
 	champ = n
 }
+
+// --- Hall-of-Fame self-play co-evolution ---
+// For COMPETITIVE tasks where fitness is relative (a policy vs an opponent), not
+// absolute against a fixed environment. Two closures supply the domain:
+//   matchfn(netA, netB, seed) float  -> A's score margin vs B (play both sides
+//                                        inside for symmetry; deterministic in seed)
+//   anchorfn(net, seed)      float    -> net's margin vs a FIXED reference (a
+//                                        scripted bot / a zero-return stub for
+//                                        pure self-play) — the absolute-progress
+//                                        signal used to ship the best champion
+// A genome's fitness = anchorfn + its margin vs a sampled LEAGUE of past
+// champions (the Hall of Fame). The anchor + frozen past selves are the standard
+// cure for the red-queen trap (naive A>B>C>A self-play cycles forever): they
+// force monotone improvement and a real Elo ladder. Returns the best-ABSOLUTE
+// champion (not the last generation's relative winner) and the HoF genome
+// timeline (a ready-made Elo ladder for the consumer to evaluate).
+
+type CoevolveCfg struct {
+	pop int
+	generations int
+	elite int
+	mut_rate float
+	mut_sigma float
+	seed int
+	hof_every int
+	hof_cap int
+	sample_n int
+	print_every int
+}
+
+func coevolve_cfg_default() (cfg) {
+	cfg = CoevolveCfg{pop: 40, generations: 160, elite: 5, mut_rate: 0.22, mut_sigma: 0.28, seed: 7, hof_every: 4, hof_cap: 14, sample_n: 3, print_every: 0}
+}
+
+func coevolve_run(topology, activations, matchfn, anchorfn, cfg) (champ, bestAnchor, hof) {
+	tb_seed(cfg.seed)
+	gnet := net_zeros(topology, activations)
+	onet := net_zeros(topology, activations)
+	gl := net_genome_len(gnet)
+
+	popG := tb_mat_empty(0)
+	i := 0
+	while i < cfg.pop {
+		popG = append(popG, tb_genome_random(gl, 1.0))
+		i = i + 1
+	}
+	// `league` is the capped set sampled as opponents; `hof` is the full champion
+	// timeline that is RETURNED (a ready-made Elo ladder — earlier vs later)
+	league := tb_mat_empty(0)
+	i = 0
+	while i < 3 {
+		league = append(league, tb_genome_random(gl, 1.0))
+		i = i + 1
+	}
+	hof = tb_mat_empty(0)
+
+	bestG := tb_genome_copy(popG[0])
+	bestAnchor = -1000000000.0
+	gen := 0
+	while gen < cfg.generations {
+		// this generation's shared league sample (same for all genomes = fair)
+		sample := tb_mat_empty(0)
+		si := 0
+		while si < cfg.sample_n && si < len(league) {
+			sample = append(sample, league[int(tb_randf() * float(len(league)))])
+			si = si + 1
+		}
+		mseed := cfg.seed + gen * 131
+
+		fit := []float{}
+		i = 0
+		while i < cfg.pop {
+			v := 0.0
+			arena {
+				net_set_genome(gnet, popG[i])
+				f := anchorfn(gnet, mseed)
+				k := 0
+				while k < len(sample) {
+					net_set_genome(onet, sample[k])
+					f = f + matchfn(gnet, onet, mseed + 101 * (k + 1))
+					k = k + 1
+				}
+				v = f
+			}
+			fit = append(fit, v)
+			i = i + 1
+		}
+		order := tb_sort_desc(fit)
+		champG := popG[order[0]]
+
+		net_set_genome(gnet, champG)
+		a := anchorfn(gnet, cfg.seed + 999)
+		if a > bestAnchor {
+			bestAnchor = a
+			bestG = tb_genome_copy(champG)
+		}
+		if cfg.print_every > 0 && gen % cfg.print_every == 0 {
+			println("{\"gen\":" + str(gen) + ",\"best_fit\":" + tb_fmt(fit[order[0]]) + ",\"champ_anchor\":" + tb_fmt(a) + ",\"hof\":" + str(len(hof)) + "}")
+			flush()
+		}
+
+		if gen % cfg.hof_every == 0 {
+			cp := tb_genome_copy(champG)
+			hof = append(hof, cp)          // full timeline (returned)
+			league = append(league, cp)    // capped opponent pool (sampled)
+			if len(league) > cfg.hof_cap {
+				nh := tb_mat_empty(0)
+				k := len(league) - cfg.hof_cap
+				while k < len(league) {
+					nh = append(nh, league[k])
+					k = k + 1
+				}
+				league = nh
+			}
+		}
+
+		next := tb_mat_empty(0)
+		e := 0
+		while e < cfg.elite && e < cfg.pop {
+			next = append(next, tb_genome_copy(popG[order[e]]))
+			e = e + 1
+		}
+		while len(next) < cfg.pop {
+			pa := popG[tb_tournament(fit)]
+			pb := popG[tb_tournament(fit)]
+			next = append(next, tb_genome_child(pa, pb, cfg.mut_rate, cfg.mut_sigma))
+		}
+		popG = next
+		gen = gen + 1
+	}
+
+	net_set_genome(gnet, bestG)
+	gnet.meta.trained_by = "coevolve-hof"
+	gnet.meta.seed = cfg.seed
+	gnet.meta.epochs = cfg.generations
+	gnet.meta.loss = 0.0 - bestAnchor
+	champ = gnet
+}

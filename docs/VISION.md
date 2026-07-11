@@ -96,6 +96,13 @@ in a real page.
   centered-rank-weighted gradient step on a mean genome; reuses the parallel
   worker pool, same `(res, champ)` contract as `evolve_run`. Pulled by the
   walker when tournament-GA proved sample-inefficient for continuous control.
+- **Hall-of-Fame self-play co-evolution** (`coevolve_run`) — for COMPETITIVE
+  tasks where fitness is relative (a policy vs an opponent), not absolute. Two
+  domain closures (`matchfn`, `anchorfn`); the framework runs population + a
+  sampled league of past champions + an anchor (the red-queen-trap fix), and
+  returns the best-absolute champion plus the HoF timeline (a ready-made Elo
+  ladder). Pulled by [machin-pong](https://github.com/javimosch/machin-pong) —
+  two nets that learn Pong by playing each other, no data, no scripted expert.
 
 ## Roadmap candidates (pull, don't push)
 

@@ -1,0 +1,41 @@
+// tinybrain — src/coevolve_test.src
+// A minimal self-play sanity test for coevolve_run: the "bigger number wins"
+// game. Each net maps a constant input to one output; a match is won by the
+// higher output, and the anchor rewards a higher output vs a zero reference.
+// Co-evolution should drive outputs up — bestAnchor climbs from ~0 toward +1.
+// Verifies the loop mechanically (population, league, selection, best-absolute).
+
+func cv_out(n) (v) {
+	o := net_forward(n, []float{1.0})
+	v = o[0]
+}
+
+func main() {
+	topo := []int{1, 2, 1}
+	acts := []string{"tanh", "tanh"}
+
+	matchfn := func(a, b, s) {
+		if cv_out(a) > cv_out(b) {
+			return 1.0
+		}
+		return 0.0 - 1.0
+	}
+	anchorfn := func(net, s) {
+		return cv_out(net)
+	}
+
+	cfg := coevolve_cfg_default()
+	cfg.pop = 24
+	cfg.generations = 40
+	cfg.print_every = 0
+
+	champ, bestAnchor, hof := coevolve_run(topo, acts, matchfn, anchorfn, cfg)
+	got := cv_out(champ)
+	println("{\"best_anchor\":" + tb_fmt(bestAnchor) + ",\"champ_out\":" + tb_fmt(got) + ",\"hof\":" + str(len(hof)) + "}")
+	if bestAnchor > 0.8 && got > 0.8 {
+		println("PASS: coevolve_run drove the population to the winning strategy")
+	} else {
+		println("FAIL: coevolve_run did not converge")
+		exit(1)
+	}
+}
